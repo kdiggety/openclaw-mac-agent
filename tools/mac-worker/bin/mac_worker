@@ -1,0 +1,255 @@
+#!/bin/bash
+set -u
+
+BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+CONFIG_FILE="${BASE_DIR}/config/env.sh"
+DEFAULT_PROJECT_ROOT="$HOME/src/your-repo/apps/DrumApp"
+WORK_DIR="${BASE_DIR}/work"
+LOG_DIR="${WORK_DIR}/logs"
+ARTIFACT_DIR="${WORK_DIR}/artifacts"
+JOB_DIR="${WORK_DIR}/jobs"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
+PROJECT_ROOT="${PROJECT_ROOT:-$DEFAULT_PROJECT_ROOT}"
+JSON_MODE=0
+JOB_ID=""
+COMMAND="${1:-}"
+shift || true
+
+now_epoch() { date +%s; }
+iso_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+ensure_dirs() { mkdir -p "$LOG_DIR" "$ARTIFACT_DIR" "$JOB_DIR"; }
+gen_job_id() { echo "job-$(date +%Y%m%d-%H%M%S)-$$"; }
+
+json_escape() {
+  python3 - <<'PY' "$1"
+import json, sys
+print(json.dumps(sys.argv[1]))
+PY
+}
+
+emit_result() {
+  local ok="$1" exit_code="$2" duration="$3" err_code="${4:-}" err_msg="${5:-}" artifacts_json="${6:-[]}" data_json="${7:-{}}"
+  if [[ "$JSON_MODE" -eq 1 ]]; then
+    if [[ "$ok" == "true" ]]; then
+      printf '{"ok":true,"command":"%s","jobId":"%s","timestamp":"%s","durationSec":%s,"artifacts":%s,"data":%s}\n' "$COMMAND" "$JOB_ID" "$(iso_now)" "$duration" "$artifacts_json" "$data_json"
+    else
+      printf '{"ok":false,"command":"%s","jobId":"%s","timestamp":"%s","durationSec":%s,"error":{"code":"%s","message":%s},"artifacts":%s,"data":%s}\n' "$COMMAND" "$JOB_ID" "$(iso_now)" "$duration" "$err_code" "$(json_escape "$err_msg")" "$artifacts_json" "$data_json"
+    fi
+  else
+    if [[ "$ok" == "true" ]]; then
+      echo "OK [$COMMAND] job=$JOB_ID duration=${duration}s"
+    else
+      echo "ERROR [$COMMAND] code=$err_code message=$err_msg" >&2
+    fi
+  fi
+  exit "$exit_code"
+}
+
+require_arg() {
+  local name="$1" value="$2"
+  if [[ -z "$value" ]]; then
+    echo "missing required arg: $name" >&2
+    exit 2
+  fi
+}
+
+parse_common_flags() {
+  REMAINING_ARGS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) JSON_MODE=1; shift ;;
+      --job-id) JOB_ID="$2"; shift 2 ;;
+      --project-root) PROJECT_ROOT="$2"; shift 2 ;;
+      *) REMAINING_ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+ensure_dirs
+parse_common_flags "$@"
+set -- "${REMAINING_ARGS[@]}"
+[[ -n "$JOB_ID" ]] || JOB_ID="$(gen_job_id)"
+JOB_PATH="${JOB_DIR}/${JOB_ID}"
+JOB_LOG_PATH="${LOG_DIR}/${JOB_ID}"
+JOB_ARTIFACT_PATH="${ARTIFACT_DIR}/${JOB_ID}"
+mkdir -p "$JOB_PATH" "$JOB_LOG_PATH" "$JOB_ARTIFACT_PATH"
+START_TS="$(now_epoch)"
+
+cmd_doctor() {
+  command -v xcodebuild >/dev/null 2>&1 || emit_result false 3 0.0 "missing_xcodebuild" "xcodebuild not found"
+  local data_json
+  data_json="{\"macOSVersion\":$(json_escape "$(sw_vers -productVersion)"),\"xcodeVersion\":$(json_escape "$(xcodebuild -version 2>/dev/null | tr '\n' ';' | xargs)"),\"developerDir\":$(json_escape "$(xcode-select -p 2>/dev/null || true)"),\"projectRoot\":$(json_escape "$PROJECT_ROOT") }"
+  local duration=$(( $(now_epoch) - START_TS ))
+  emit_result true 0 "$duration" "" "" "[]" "$data_json"
+}
+
+cmd_build() {
+  local scheme="" workspace="" project="" configuration="Debug" destination="platform=macOS" derived_data=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scheme) scheme="$2"; shift 2 ;;
+      --workspace) workspace="$2"; shift 2 ;;
+      --project) project="$2"; shift 2 ;;
+      --configuration) configuration="$2"; shift 2 ;;
+      --destination) destination="$2"; shift 2 ;;
+      --derived-data) derived_data="$2"; shift 2 ;;
+      *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+  done
+  require_arg --scheme "$scheme"
+  [[ -n "$workspace" || -n "$project" ]] || { echo "must provide --workspace or --project" >&2; exit 2; }
+  [[ -z "$workspace" || -z "$project" ]] || { echo "provide only one of --workspace or --project" >&2; exit 2; }
+  [[ -n "$derived_data" ]] || derived_data="${JOB_PATH}/DerivedData"
+  mkdir -p "$derived_data"
+  local log_file="${JOB_LOG_PATH}/build.log" status data_json artifacts_json
+  pushd "$PROJECT_ROOT" >/dev/null || emit_result false 3 0.0 "invalid_project_root" "project root not found: $PROJECT_ROOT"
+  local args=(build -scheme "$scheme" -configuration "$configuration" -destination "$destination" -derivedDataPath "$derived_data")
+  if [[ -n "$workspace" ]]; then args=(-workspace "$workspace" "${args[@]}"); else args=(-project "$project" "${args[@]}"); fi
+  set +e
+  xcodebuild "${args[@]}" >"$log_file" 2>&1
+  status=$?
+  set -e
+  popd >/dev/null || true
+  artifacts_json="[$(json_escape "$log_file")]"
+  data_json="{\"scheme\":$(json_escape "$scheme"),\"configuration\":$(json_escape "$configuration"),\"destination\":$(json_escape "$destination"),\"derivedDataPath\":$(json_escape "$derived_data") }"
+  local duration=$(( $(now_epoch) - START_TS ))
+  [[ $status -eq 0 ]] || emit_result false 4 "$duration" "xcodebuild_failed" "xcodebuild exited with status $status" "$artifacts_json" "$data_json"
+  emit_result true 0 "$duration" "" "" "$artifacts_json" "$data_json"
+}
+
+cmd_test() {
+  local scheme="" workspace="" project="" destination="platform=macOS" result_bundle="${JOB_ARTIFACT_PATH}/TestResults.xcresult"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scheme) scheme="$2"; shift 2 ;;
+      --workspace) workspace="$2"; shift 2 ;;
+      --project) project="$2"; shift 2 ;;
+      --destination) destination="$2"; shift 2 ;;
+      --result-bundle) result_bundle="$2"; shift 2 ;;
+      *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+  done
+  require_arg --scheme "$scheme"
+  [[ -n "$workspace" || -n "$project" ]] || { echo "must provide --workspace or --project" >&2; exit 2; }
+  local log_file="${JOB_LOG_PATH}/test.log" status data_json artifacts_json
+  pushd "$PROJECT_ROOT" >/dev/null || emit_result false 3 0.0 "invalid_project_root" "project root not found: $PROJECT_ROOT"
+  local args=(test -scheme "$scheme" -destination "$destination" -resultBundlePath "$result_bundle")
+  if [[ -n "$workspace" ]]; then args=(-workspace "$workspace" "${args[@]}"); else args=(-project "$project" "${args[@]}"); fi
+  set +e
+  xcodebuild "${args[@]}" >"$log_file" 2>&1
+  status=$?
+  set -e
+  popd >/dev/null || true
+  artifacts_json="[$(json_escape "$log_file"),$(json_escape "$result_bundle")]"
+  data_json="{\"scheme\":$(json_escape "$scheme"),\"destination\":$(json_escape "$destination") }"
+  local duration=$(( $(now_epoch) - START_TS ))
+  [[ $status -eq 0 ]] || emit_result false 5 "$duration" "tests_failed" "xcodebuild test exited with status $status" "$artifacts_json" "$data_json"
+  emit_result true 0 "$duration" "" "" "$artifacts_json" "$data_json"
+}
+
+resolve_sim_udid() {
+  local sim_name="$1"
+  xcrun simctl list devices available | grep -F "$sim_name" | head -n1 | sed -n 's/.*(\([A-F0-9-]*\)).*/\1/p'
+}
+
+cmd_ui_test() {
+  local scheme="" workspace="" project="" sim_name="iPhone 16" result_bundle="${JOB_ARTIFACT_PATH}/UITestResults.xcresult"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scheme) scheme="$2"; shift 2 ;;
+      --workspace) workspace="$2"; shift 2 ;;
+      --project) project="$2"; shift 2 ;;
+      --simulator) sim_name="$2"; shift 2 ;;
+      --result-bundle) result_bundle="$2"; shift 2 ;;
+      *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+  done
+  require_arg --scheme "$scheme"
+  local udid
+  udid="$(resolve_sim_udid "$sim_name")"
+  [[ -n "$udid" ]] || emit_result false 6 0.0 "simulator_not_found" "could not find simulator named $sim_name"
+  xcrun simctl boot "$udid" >/dev/null 2>&1 || true
+  open -a Simulator >/dev/null 2>&1 || true
+  local destination="platform=iOS Simulator,id=${udid}"
+  local log_file="${JOB_LOG_PATH}/ui-test.log" status data_json artifacts_json
+  pushd "$PROJECT_ROOT" >/dev/null || emit_result false 3 0.0 "invalid_project_root" "project root not found: $PROJECT_ROOT"
+  local args=(test -scheme "$scheme" -destination "$destination" -resultBundlePath "$result_bundle")
+  if [[ -n "$workspace" ]]; then args=(-workspace "$workspace" "${args[@]}"); else args=(-project "$project" "${args[@]}"); fi
+  set +e
+  xcodebuild "${args[@]}" >"$log_file" 2>&1
+  status=$?
+  set -e
+  popd >/dev/null || true
+  artifacts_json="[$(json_escape "$log_file"),$(json_escape "$result_bundle")]"
+  data_json="{\"scheme\":$(json_escape "$scheme"),\"simulator\":$(json_escape "$sim_name"),\"udid\":$(json_escape "$udid") }"
+  local duration=$(( $(now_epoch) - START_TS ))
+  [[ $status -eq 0 ]] || emit_result false 5 "$duration" "ui_tests_failed" "xcodebuild ui-test exited with status $status" "$artifacts_json" "$data_json"
+  emit_result true 0 "$duration" "" "" "$artifacts_json" "$data_json"
+}
+
+cmd_launch() {
+  local app_path=""
+  while [[ $# -gt 0 ]]; do case "$1" in --app) app_path="$2"; shift 2 ;; *) echo "unknown arg: $1" >&2; exit 2 ;; esac; done
+  require_arg --app "$app_path"
+  set +e; open "$app_path" >/dev/null 2>&1; local status=$?; set -e
+  local duration=$(( $(now_epoch) - START_TS ))
+  [[ $status -eq 0 ]] || emit_result false 7 "$duration" "launch_failed" "failed to launch app: $app_path"
+  emit_result true 0 "$duration" "" "" "[]" "{\"app\":$(json_escape "$app_path") }"
+}
+
+cmd_screenshot() {
+  local out="${JOB_ARTIFACT_PATH}/screenshot-$(date +%Y%m%d-%H%M%S).png"
+  while [[ $# -gt 0 ]]; do case "$1" in --out) out="$2"; shift 2 ;; *) echo "unknown arg: $1" >&2; exit 2 ;; esac; done
+  [[ "$out" = /* ]] || out="${JOB_ARTIFACT_PATH}/${out}"
+  mkdir -p "$(dirname "$out")"
+  set +e; screencapture -x "$out"; local status=$?; set -e
+  local duration=$(( $(now_epoch) - START_TS ))
+  [[ $status -eq 0 ]] || emit_result false 8 "$duration" "screenshot_failed" "failed to capture screenshot"
+  emit_result true 0 "$duration" "" "" "[$(json_escape "$out")]" "{\"output\":$(json_escape "$out") }"
+}
+
+cmd_collect_logs() {
+  local interval="10m"
+  while [[ $# -gt 0 ]]; do case "$1" in --last) interval="$2"; shift 2 ;; *) echo "unknown arg: $1" >&2; exit 2 ;; esac; done
+  local out="${JOB_ARTIFACT_PATH}/unified.log"
+  set +e; log show --last "$interval" --style compact >"$out" 2>&1; local status=$?; set -e
+  local duration=$(( $(now_epoch) - START_TS ))
+  [[ $status -eq 0 ]] || emit_result false 8 "$duration" "log_collection_failed" "failed to collect logs"
+  emit_result true 0 "$duration" "" "" "[$(json_escape "$out")]" "{\"interval\":$(json_escape "$interval") }"
+}
+
+cmd_record_video() {
+  local duration=$(( $(now_epoch) - START_TS ))
+  emit_result false 9 "$duration" "unsupported" "record-video is not implemented in shell v1"
+}
+
+case "$COMMAND" in
+  doctor) cmd_doctor "$@" ;;
+  build) cmd_build "$@" ;;
+  test) cmd_test "$@" ;;
+  ui-test) cmd_ui_test "$@" ;;
+  launch) cmd_launch "$@" ;;
+  screenshot) cmd_screenshot "$@" ;;
+  collect-logs) cmd_collect_logs "$@" ;;
+  record-video) cmd_record_video "$@" ;;
+  ""|help|--help|-h)
+    cat <<USAGE
+Usage: mac_worker <command> [--json] [--job-id ID] [--project-root PATH]
+Commands:
+  doctor
+  build --scheme NAME [--workspace FILE | --project FILE] [--configuration Debug|Release] [--destination DEST]
+  test --scheme NAME [--workspace FILE | --project FILE] [--destination DEST]
+  ui-test --scheme NAME [--workspace FILE | --project FILE] [--simulator NAME]
+  launch --app PATH
+  screenshot [--out FILE]
+  collect-logs [--last 10m]
+  record-video
+USAGE
+    ;;
+  *) echo "unknown command: $COMMAND" >&2; exit 9 ;;
+esac
