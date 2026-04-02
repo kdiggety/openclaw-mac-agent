@@ -94,6 +94,70 @@ else:
 PY
 }
 
+json_compact() {
+  local json_payload="$1"
+  MAC_WRAPPER_JSON="$json_payload" python3 - <<'PY'
+import json
+import os
+
+print(json.dumps(json.loads(os.environ["MAC_WRAPPER_JSON"]), separators=(",", ":")))
+PY
+}
+
+synthesize_failure_json() {
+  local command_name="$1"
+  local job_id="$2"
+  local error_code="$3"
+  local error_message="$4"
+  local artifact_path="${5:-}"
+  local log_path="${6:-}"
+  local artifacts_json="[]"
+
+  if [[ -n "$artifact_path" && -n "$log_path" ]]; then
+    artifacts_json="$(python3 - <<'PY' "$log_path" "$artifact_path"
+import json
+import sys
+
+print(json.dumps([sys.argv[1], sys.argv[2]], separators=(",", ":")))
+PY
+)"
+  elif [[ -n "$log_path" ]]; then
+    artifacts_json="$(python3 - <<'PY' "$log_path"
+import json
+import sys
+
+print(json.dumps([sys.argv[1]], separators=(",", ":")))
+PY
+)"
+  fi
+
+  python3 - <<'PY' \
+    "$command_name" \
+    "$job_id" \
+    "$error_code" \
+    "$error_message" \
+    "$artifacts_json"
+import json
+import sys
+from datetime import datetime, timezone
+
+payload = {
+    "ok": False,
+    "command": sys.argv[1],
+    "jobId": sys.argv[2],
+    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "durationSec": 0,
+    "error": {
+        "code": sys.argv[3],
+        "message": sys.argv[4],
+    },
+    "artifacts": json.loads(sys.argv[5]),
+    "data": {},
+}
+print(json.dumps(payload, separators=(",", ":")))
+PY
+}
+
 copy_job_artifacts() {
   local job_id="$1"
   if [[ "$MAC_COPY_ARTIFACTS" != "1" ]]; then
@@ -111,6 +175,11 @@ print_result_summary() {
   printf '%s: ok=%s jobId=%s\n' "$stage" "$ok" "$job_id"
 }
 
+new_job_id() {
+  local stage="$1"
+  printf 'wrapper-%s-%s-%s\n' "$stage" "$(date +%Y%m%d-%H%M%S)" "$$"
+}
+
 print_artifact_note() {
   if [[ "$MAC_COPY_ARTIFACTS" == "1" ]]; then
     printf 'artifacts: copy enabled -> %s\n' "$MAC_ARTIFACT_OUT"
@@ -119,40 +188,52 @@ print_artifact_note() {
   fi
 }
 
+DOCTOR_JOB_ID="$(new_job_id doctor)"
 DOCTOR_STATUS_CODE=0
-DOCTOR_JSON="$(run_remote_json_capture doctor)" || DOCTOR_STATUS_CODE=$?
+DOCTOR_JSON="$(run_remote_json_capture doctor --job-id "$DOCTOR_JOB_ID")" || DOCTOR_STATUS_CODE=$?
 [[ -n "$DOCTOR_JSON" ]] || {
   printf 'doctor returned no JSON output\n' >&2
   exit 4
 }
+DOCTOR_JSON="$(json_compact "$DOCTOR_JSON")"
 print_result_summary doctor "$DOCTOR_JSON"
 if [[ "$DOCTOR_STATUS_CODE" -ne 0 || "$(json_field "$DOCTOR_JSON" "ok")" != "true" ]]; then
   printf '%s\n' "$DOCTOR_JSON"
   exit 1
 fi
 
+WORK_ROOT="$(json_field "$DOCTOR_JSON" "data.workRoot")"
+
+BUILD_JOB_ID="$(new_job_id build)"
 BUILD_STATUS_CODE=0
-BUILD_JSON="$(run_remote_json_capture build)" || BUILD_STATUS_CODE=$?
+BUILD_JSON="$(run_remote_json_capture build --job-id "$BUILD_JOB_ID")" || BUILD_STATUS_CODE=$?
 [[ -n "$BUILD_JSON" ]] || {
   printf 'build returned no JSON output\n' >&2
   exit 4
 }
+BUILD_JSON="$(json_compact "$BUILD_JSON")"
 print_result_summary build "$BUILD_JSON"
-BUILD_JOB_ID="$(json_field "$BUILD_JSON" "jobId")"
 copy_job_artifacts "$BUILD_JOB_ID"
 if [[ "$BUILD_STATUS_CODE" -ne 0 || "$(json_field "$BUILD_JSON" "ok")" != "true" ]]; then
   printf '%s\n' "$BUILD_JSON"
   exit 2
 fi
 
+TEST_JOB_ID="$(new_job_id test)"
 TEST_STATUS_CODE=0
-TEST_JSON="$(run_remote_json_capture test)" || TEST_STATUS_CODE=$?
-[[ -n "$TEST_JSON" ]] || {
-  printf 'test returned no JSON output\n' >&2
-  exit 4
-}
+TEST_JSON="$(run_remote_json_capture test --job-id "$TEST_JOB_ID")" || TEST_STATUS_CODE=$?
+if [[ -z "$TEST_JSON" ]]; then
+  TEST_JSON="$(synthesize_failure_json \
+    test \
+    "$TEST_JOB_ID" \
+    remote_test_failed_without_json \
+    "remote test exited with status $TEST_STATUS_CODE before returning JSON; inspect remote test.log and TestResults.xcresult" \
+    "${WORK_ROOT}/artifacts/${TEST_JOB_ID}/TestResults.xcresult" \
+    "${WORK_ROOT}/logs/${TEST_JOB_ID}/test.log")"
+else
+  TEST_JSON="$(json_compact "$TEST_JSON")"
+fi
 print_result_summary test "$TEST_JSON"
-TEST_JOB_ID="$(json_field "$TEST_JSON" "jobId")"
 copy_job_artifacts "$TEST_JOB_ID"
 
 DOCTOR_STATUS="$(json_field "$DOCTOR_JSON" "ok")"
