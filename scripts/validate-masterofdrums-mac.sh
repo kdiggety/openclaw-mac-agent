@@ -60,6 +60,21 @@ run_remote_json() {
   ssh -i "$MAC_SSH_KEY" "$MAC_HOST" "mac_worker $command_name --project-profile $MAC_WORKER_PROFILE --json $*"
 }
 
+run_remote_json_capture() {
+  local command_name="$1"
+  shift
+  local json_payload=""
+  local status=0
+
+  set +e
+  json_payload="$(run_remote_json "$command_name" "$@")"
+  status=$?
+  set -e
+
+  printf '%s' "$json_payload"
+  return "$status"
+}
+
 json_field() {
   local json_payload="$1"
   local field_path="$2"
@@ -104,23 +119,38 @@ print_artifact_note() {
   fi
 }
 
-DOCTOR_JSON="$(run_remote_json doctor)"
+DOCTOR_STATUS_CODE=0
+DOCTOR_JSON="$(run_remote_json_capture doctor)" || DOCTOR_STATUS_CODE=$?
+[[ -n "$DOCTOR_JSON" ]] || {
+  printf 'doctor returned no JSON output\n' >&2
+  exit 4
+}
 print_result_summary doctor "$DOCTOR_JSON"
-if [[ "$(json_field "$DOCTOR_JSON" "ok")" != "true" ]]; then
+if [[ "$DOCTOR_STATUS_CODE" -ne 0 || "$(json_field "$DOCTOR_JSON" "ok")" != "true" ]]; then
   printf '%s\n' "$DOCTOR_JSON"
   exit 1
 fi
 
-BUILD_JSON="$(run_remote_json build)"
+BUILD_STATUS_CODE=0
+BUILD_JSON="$(run_remote_json_capture build)" || BUILD_STATUS_CODE=$?
+[[ -n "$BUILD_JSON" ]] || {
+  printf 'build returned no JSON output\n' >&2
+  exit 4
+}
 print_result_summary build "$BUILD_JSON"
 BUILD_JOB_ID="$(json_field "$BUILD_JSON" "jobId")"
 copy_job_artifacts "$BUILD_JOB_ID"
-if [[ "$(json_field "$BUILD_JSON" "ok")" != "true" ]]; then
+if [[ "$BUILD_STATUS_CODE" -ne 0 || "$(json_field "$BUILD_JSON" "ok")" != "true" ]]; then
   printf '%s\n' "$BUILD_JSON"
   exit 2
 fi
 
-TEST_JSON="$(run_remote_json test)"
+TEST_STATUS_CODE=0
+TEST_JSON="$(run_remote_json_capture test)" || TEST_STATUS_CODE=$?
+[[ -n "$TEST_JSON" ]] || {
+  printf 'test returned no JSON output\n' >&2
+  exit 4
+}
 print_result_summary test "$TEST_JSON"
 TEST_JOB_ID="$(json_field "$TEST_JSON" "jobId")"
 copy_job_artifacts "$TEST_JOB_ID"
@@ -159,6 +189,10 @@ PY
 
 printf '%s\n' "$SUMMARY_JSON"
 print_artifact_note
+
+if [[ "$TEST_STATUS_CODE" -ne 0 && "$TEST_STATUS" == "true" ]]; then
+  printf 'warning: test exited nonzero but reported ok=true\n' >&2
+fi
 
 if [[ "$TEST_STATUS" != "true" && "$MAC_STRICT_TESTS" == "1" ]]; then
   exit 3
