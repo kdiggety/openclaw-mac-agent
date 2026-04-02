@@ -156,6 +156,19 @@ bash ./scripts/test-mac-worker-v1.sh
 
 That script uses fake Apple tool stubs so it can validate the `mac_worker` command contract and remote orchestration workflow shape without needing a real app project in this repo.
 
+For the real `masterofdrums-pipeline` remote validation flow from Linux/OpenClaw, use:
+
+```bash
+bash ./scripts/validate-masterofdrums-mac.sh
+```
+
+By default this wrapper:
+
+- calls remote `doctor`, `build`, and `test`
+- requires `doctor` and `build` to pass
+- collects job artifacts/logs locally
+- reports `test` failures in the summary without failing the wrapper unless `MAC_STRICT_TESTS=1` is set
+
 ## Artifacts And Logs
 
 All worker-owned output goes under the macOS worker user's home directory:
