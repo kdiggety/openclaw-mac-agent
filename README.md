@@ -166,8 +166,10 @@ By default this wrapper:
 
 - calls remote `doctor`, `build`, and `test`
 - requires `doctor` and `build` to pass
-- collects job artifacts/logs locally
+- skips direct artifact copying when using the forced-command SSH key
 - reports `test` failures in the summary without failing the wrapper unless `MAC_STRICT_TESTS=1` is set
+
+The wrapper reports `jobId` values and remote artifact paths in JSON. Direct `rsync`/artifact copying is not attempted by default because the recommended SSH key is intentionally restricted to `mac_worker` commands by the forced-command gate.
 
 ## Artifacts And Logs
 

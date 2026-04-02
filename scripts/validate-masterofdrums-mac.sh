@@ -13,6 +13,7 @@ Environment overrides:
   MAC_SSH_KEY                 default: ~/.ssh/id_ed25519
   MAC_WORKER_PROFILE          default: masterofdrums-pipeline
   MAC_ARTIFACT_OUT            default: ./mac-validation-artifacts
+  MAC_COPY_ARTIFACTS          default: 0
   MAC_STRICT_TESTS            default: 0
 
 Exit codes:
@@ -33,6 +34,7 @@ MAC_HOST="${1:-${MAC_HOST:-openclaw-agent@192.168.1.156}}"
 MAC_SSH_KEY="${MAC_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 MAC_WORKER_PROFILE="${MAC_WORKER_PROFILE:-masterofdrums-pipeline}"
 MAC_ARTIFACT_OUT="${MAC_ARTIFACT_OUT:-./mac-validation-artifacts}"
+MAC_COPY_ARTIFACTS="${MAC_COPY_ARTIFACTS:-0}"
 MAC_STRICT_TESTS="${MAC_STRICT_TESTS:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -43,6 +45,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 }
 
 mkdir -p "$MAC_ARTIFACT_OUT"
+
+case "$MAC_COPY_ARTIFACTS" in
+  0|1) ;;
+  *)
+    printf 'MAC_COPY_ARTIFACTS must be 0 or 1\n' >&2
+    exit 4
+    ;;
+esac
 
 run_remote_json() {
   local command_name="$1"
@@ -71,6 +81,9 @@ PY
 
 copy_job_artifacts() {
   local job_id="$1"
+  if [[ "$MAC_COPY_ARTIFACTS" != "1" ]]; then
+    return 0
+  fi
   "$SCRIPT_DIR/collect-mac-artifacts.sh" "$MAC_HOST" "$job_id" "$MAC_ARTIFACT_OUT" >/dev/null
 }
 
@@ -81,6 +94,14 @@ print_result_summary() {
   ok="$(json_field "$json_payload" "ok")"
   job_id="$(json_field "$json_payload" "jobId")"
   printf '%s: ok=%s jobId=%s\n' "$stage" "$ok" "$job_id"
+}
+
+print_artifact_note() {
+  if [[ "$MAC_COPY_ARTIFACTS" == "1" ]]; then
+    printf 'artifacts: copy enabled -> %s\n' "$MAC_ARTIFACT_OUT"
+  else
+    printf 'artifacts: copy skipped (forced-command SSH key cannot rsync); use jobId/artifact paths from JSON or rerun with MAC_COPY_ARTIFACTS=1 only if you have a separate non-gated artifact path\n'
+  fi
 }
 
 DOCTOR_JSON="$(run_remote_json doctor)"
@@ -137,6 +158,7 @@ PY
 )"
 
 printf '%s\n' "$SUMMARY_JSON"
+print_artifact_note
 
 if [[ "$TEST_STATUS" != "true" && "$MAC_STRICT_TESTS" == "1" ]]; then
   exit 3
