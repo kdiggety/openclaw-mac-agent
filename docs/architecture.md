@@ -34,6 +34,13 @@ The worker should expose a small stable surface:
 - `screenshot`
 - `collect-logs`
 
+Profiles provide project-specific defaults and allowlists so the core worker stays reusable across multiple Apple app projects.
+
+## Execution modes
+
+- `dev`: local Mac developer workflows, still narrow but more flexible
+- `hardened`: profile-required remote mode intended for SSH forced-command use
+
 ## Version control model
 
 All source stays in GitHub. The same repo is cloned on Linux and on the Mac. Linux triggers commands against the Mac checkout via SSH.

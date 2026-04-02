@@ -3,22 +3,17 @@ import ArgumentParser
 
 struct Test: ParsableCommand {
     @Flag(help: "Emit JSON output") var json = false
+    @Option(help: "Execution mode") var mode: String?
+    @Option(help: "Job identifier") var jobId: String?
+    @Option(help: "Project profile") var projectProfile: String?
+    @Option(help: "Project root") var projectRoot: String?
+    @Option(help: "Scheme") var scheme: String?
+    @Option(help: "Workspace path") var workspace: String?
+    @Option(help: "Project path") var project: String?
+    @Option(help: "Destination") var destination: String?
+    @Option(help: "Result bundle path") var resultBundle: String?
+
     func run() throws {
-        let response = WorkerResponse(
-            ok: false,
-            command: "test",
-            jobId: "job-\(Int(Date().timeIntervalSince1970))",
-            timestamp: ISO8601DateFormatter().string(from: Date()),
-            durationSec: 0,
-            error: WorkerError(code: "not_implemented", message: "Swift implementation scaffold only; use shell worker for v1"),
-            artifacts: [],
-            data: EmptyData()
-        )
-        if json {
-            try JSONPrinter.printResponse(response)
-        } else {
-            print("Use shell worker for v1")
-        }
-        Foundation.exit(1)
+        try StubResponse.printNotImplemented(command: "test", json: json)
     }
 }

@@ -5,18 +5,24 @@ struct DoctorData: Codable {
     let macOSVersion: String
     let xcodeVersion: String
     let developerDir: String
+    let mode: String
+    let projectProfile: String
     let projectRoot: String
 }
 
 struct Doctor: ParsableCommand {
     @Flag(help: "Emit JSON output") var json = false
+    @Option(help: "Execution mode") var mode: String?
     @Option(help: "Job identifier") var jobId: String?
+    @Option(help: "Project profile") var projectProfile: String?
     @Option(help: "Project root") var projectRoot: String?
 
     func run() throws {
         let start = Date()
         let resolvedJobId = jobId ?? "job-\(Int(start.timeIntervalSince1970))"
-        let root = projectRoot ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/src/your-repo/apps/DrumApp"
+        let resolvedMode = mode ?? "dev"
+        let resolvedProfile = projectProfile ?? ""
+        let root = projectRoot ?? FileManager.default.currentDirectoryPath
 
         let xcode = try Shell.run("/usr/bin/xcodebuild", ["-version"])
         let devDir = try Shell.run("/usr/bin/xcode-select", ["-p"])
@@ -26,6 +32,8 @@ struct Doctor: ParsableCommand {
             macOSVersion: macOSVersion.stdout.trimmingCharacters(in: .whitespacesAndNewlines),
             xcodeVersion: xcode.stdout.trimmingCharacters(in: .whitespacesAndNewlines),
             developerDir: devDir.stdout.trimmingCharacters(in: .whitespacesAndNewlines),
+            mode: resolvedMode,
+            projectProfile: resolvedProfile,
             projectRoot: root
         )
 

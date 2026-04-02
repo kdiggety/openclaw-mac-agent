@@ -1,0 +1,100 @@
+#!/bin/bash
+set -euo pipefail
+
+BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+WORKER_BIN="${BASE_DIR}/bin/mac_worker"
+GATE_LOG="${MAC_WORKER_SSH_GATE_LOG:-$HOME/mac-worker/ssh-gate.log}"
+
+log_invocation() {
+  mkdir -p "$(dirname "$GATE_LOG")"
+  printf '%s remote=%s command=%s\n' \
+    "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    "${SSH_CONNECTION:-unknown}" \
+    "${SSH_ORIGINAL_COMMAND:-}" >>"$GATE_LOG"
+}
+
+reject() {
+  log_invocation
+  printf 'mac_worker_ssh_gate: %s\n' "$1" >&2
+  exit 126
+}
+
+parse_original_command() {
+  python3 - <<'PY' "${SSH_ORIGINAL_COMMAND:-}"
+import shlex
+import sys
+
+command = sys.argv[1]
+if not command.strip():
+    sys.exit(1)
+
+try:
+    parts = shlex.split(command)
+except ValueError:
+    sys.exit(2)
+
+for part in parts:
+    sys.stdout.write(part)
+    sys.stdout.write("\0")
+PY
+}
+
+validate_and_exec() {
+  local -a parsed=("$@")
+  [[ ${#parsed[@]} -ge 2 ]] || reject "expected 'mac_worker <command> ...'"
+
+  local bin_name="${parsed[0]}"
+  case "$bin_name" in
+    mac_worker|*/mac_worker) ;;
+    *) reject "command must start with mac_worker" ;;
+  esac
+
+  local subcommand="${parsed[1]}"
+  case "$subcommand" in
+    doctor|build|test|ui-test|launch|screenshot|collect-logs) ;;
+    *) reject "subcommand not allowed: ${subcommand}" ;;
+  esac
+
+  local -a forwarded=()
+  local i=2
+  while [[ $i -lt ${#parsed[@]} ]]; do
+    local arg="${parsed[$i]}"
+    case "$arg" in
+      --json)
+        forwarded+=("$arg")
+        ;;
+      --job-id|--project-profile|--scheme|--destination|--simulator|--configuration|--last|--bundle-id)
+        (( i + 1 < ${#parsed[@]} )) || reject "missing value for ${arg}"
+        forwarded+=("$arg" "${parsed[$((i + 1))]}")
+        ((i++))
+        ;;
+      --project-root|--workspace|--project|--derived-data|--result-bundle|--out|--app|--mode)
+        reject "flag not allowed over forced-command SSH: ${arg}"
+        ;;
+      *)
+        reject "unknown or unsafe flag: ${arg}"
+        ;;
+    esac
+    ((i++))
+  done
+
+  log_invocation
+  exec "$WORKER_BIN" "$subcommand" --mode hardened "${forwarded[@]}"
+}
+
+ORIGINAL_ARGS=()
+set +e
+while IFS= read -r -d '' item; do
+  ORIGINAL_ARGS+=("$item")
+done < <(parse_original_command)
+parse_status=$?
+set -e
+
+case $parse_status in
+  0) ;;
+  1) reject "empty SSH command" ;;
+  2) reject "unable to parse SSH command" ;;
+  *) reject "unexpected SSH command parse failure" ;;
+esac
+
+validate_and_exec "${ORIGINAL_ARGS[@]}"

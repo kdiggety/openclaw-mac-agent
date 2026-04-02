@@ -1,0 +1,17 @@
+{
+  "projectRoot": "/Users/your-user/src/apple-apps/sample-ios-app",
+  "workspacePath": "SampleiOSApp.xcworkspace",
+  "defaultScheme": "SampleiOSApp",
+  "allowedSchemes": [
+    "SampleiOSApp"
+  ],
+  "defaultDestination": "platform=iOS Simulator,name=iPhone 16",
+  "allowedDestinations": [
+    "platform=iOS Simulator,name=iPhone 16"
+  ],
+  "defaultSimulator": "iPhone 16",
+  "allowedSimulators": [
+    "iPhone 16"
+  ],
+  "bundleId": "com.example.SampleiOSApp"
+}

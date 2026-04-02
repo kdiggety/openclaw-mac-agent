@@ -1,232 +1,948 @@
 #!/bin/bash
-set -u
+set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG_FILE="${BASE_DIR}/config/env.sh"
-DEFAULT_PROJECT_ROOT="$HOME/src/your-repo/apps/DrumApp"
-WORK_DIR="${BASE_DIR}/work"
-LOG_DIR="${WORK_DIR}/logs"
-ARTIFACT_DIR="${WORK_DIR}/artifacts"
-JOB_DIR="${WORK_DIR}/jobs"
+PROJECTS_DIR="${BASE_DIR}/config/projects"
 
 if [[ -f "$CONFIG_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 fi
 
-PROJECT_ROOT="${PROJECT_ROOT:-$DEFAULT_PROJECT_ROOT}"
-JSON_MODE=0
-JOB_ID=""
+WORKER_HOME="${MAC_WORKER_HOME:-$HOME/mac-worker}"
+WORK_ROOT="${WORKER_HOME}/work"
+LOG_ROOT="${WORK_ROOT}/logs"
+ARTIFACT_ROOT="${WORK_ROOT}/artifacts"
+JOB_ROOT="${WORK_ROOT}/jobs"
+DEFAULT_PROJECT_ROOT="${MAC_WORKER_DEFAULT_PROJECT_ROOT:-$PWD}"
+DEFAULT_MODE="${MAC_WORKER_DEFAULT_MODE:-dev}"
+
 COMMAND="${1:-}"
-shift || true
+if [[ -n "$COMMAND" ]]; then
+  shift
+fi
+
+JSON_MODE=0
+MODE="$DEFAULT_MODE"
+JOB_ID=""
+PROJECT_PROFILE=""
+PROJECT_ROOT=""
+PROJECT_ROOT_EXPLICIT=0
+START_TS=0
+JOB_PATH=""
+JOB_LOG_PATH=""
+JOB_ARTIFACT_PATH=""
+PROFILE_PATH=""
+PROFILE_ROOT=""
+PROFILE_WORKSPACE=""
+PROFILE_PROJECT=""
+PROFILE_DEFAULT_SCHEME=""
+PROFILE_DEFAULT_DESTINATION=""
+PROFILE_DEFAULT_SIMULATOR=""
+PROFILE_BUNDLE_ID=""
+REMAINING_ARGS=()
+RESOLVED_WORKSPACE=""
+RESOLVED_PROJECT=""
+RESOLVED_SCHEME=""
+RESOLVED_DESTINATION=""
+RESOLVED_SIMULATOR=""
 
 now_epoch() { date +%s; }
 iso_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-ensure_dirs() { mkdir -p "$LOG_DIR" "$ARTIFACT_DIR" "$JOB_DIR"; }
-gen_job_id() { echo "job-$(date +%Y%m%d-%H%M%S)-$$"; }
 
 json_escape() {
   python3 - <<'PY' "$1"
-import json, sys
+import json
+import sys
 print(json.dumps(sys.argv[1]))
 PY
 }
 
+empty_json_object() {
+  printf '{}'
+}
+
+empty_json_array() {
+  printf '[]'
+}
+
+print_usage() {
+  cat <<'USAGE'
+Usage: mac_worker <command> [common options] [command options]
+
+Commands:
+  doctor
+  build
+  test
+  ui-test
+  launch
+  screenshot
+  collect-logs
+
+Common options:
+  --json
+  --mode dev|hardened
+  --job-id ID
+  --project-profile NAME
+  --project-root PATH        (dev mode only)
+
+Examples:
+  mac_worker doctor --json
+  mac_worker build --mode dev --project-root /path/to/repo --workspace App.xcworkspace --scheme App --json
+  mac_worker test --mode hardened --project-profile sample-macos-app --json
+USAGE
+}
+
+ensure_base_dirs() {
+  mkdir -p "$WORK_ROOT" "$LOG_ROOT" "$ARTIFACT_ROOT" "$JOB_ROOT"
+}
+
+sanitize_job_id() {
+  local value="$1"
+  [[ "$value" =~ ^[A-Za-z0-9._-]{1,64}$ ]]
+}
+
+gen_job_id() {
+  printf 'job-%s-%s\n' "$(date +%Y%m%d-%H%M%S)" "$$"
+}
+
+duration_sec() {
+  local end_ts
+  end_ts="$(now_epoch)"
+  echo "$(( end_ts - START_TS ))"
+}
+
 emit_result() {
-  local ok="$1" exit_code="$2" duration="$3" err_code="${4:-}" err_msg="${5:-}" artifacts_json="${6:-[]}" data_json="${7:-{}}"
+  local ok="$1"
+  local exit_code="$2"
+  local duration="$3"
+  local err_code="${4-}"
+  local err_msg="${5-}"
+  local artifacts_json="${6-}"
+  local data_json="${7-}"
+
+  [[ -n "$artifacts_json" ]] || artifacts_json='[]'
+  [[ -n "$data_json" ]] || data_json='{}'
+
   if [[ "$JSON_MODE" -eq 1 ]]; then
     if [[ "$ok" == "true" ]]; then
-      printf '{"ok":true,"command":"%s","jobId":"%s","timestamp":"%s","durationSec":%s,"artifacts":%s,"data":%s}\n' "$COMMAND" "$JOB_ID" "$(iso_now)" "$duration" "$artifacts_json" "$data_json"
+      python3 - <<'PY' \
+        "$COMMAND" "$JOB_ID" "$(iso_now)" "$duration" "$artifacts_json" "$data_json"
+import json
+import sys
+
+payload = {
+    "ok": True,
+    "command": sys.argv[1],
+    "jobId": sys.argv[2],
+    "timestamp": sys.argv[3],
+    "durationSec": int(sys.argv[4]),
+    "artifacts": json.loads(sys.argv[5]),
+    "data": json.loads(sys.argv[6]),
+}
+print(json.dumps(payload, separators=(",", ":")))
+PY
     else
-      printf '{"ok":false,"command":"%s","jobId":"%s","timestamp":"%s","durationSec":%s,"error":{"code":"%s","message":%s},"artifacts":%s,"data":%s}\n' "$COMMAND" "$JOB_ID" "$(iso_now)" "$duration" "$err_code" "$(json_escape "$err_msg")" "$artifacts_json" "$data_json"
+      python3 - <<'PY' \
+        "$COMMAND" "$JOB_ID" "$(iso_now)" "$duration" "$err_code" "$err_msg" "$artifacts_json" "$data_json"
+import json
+import sys
+
+payload = {
+    "ok": False,
+    "command": sys.argv[1],
+    "jobId": sys.argv[2],
+    "timestamp": sys.argv[3],
+    "durationSec": int(sys.argv[4]),
+    "error": {
+        "code": sys.argv[5],
+        "message": sys.argv[6],
+    },
+    "artifacts": json.loads(sys.argv[7]),
+    "data": json.loads(sys.argv[8]),
+}
+print(json.dumps(payload, separators=(",", ":")))
+PY
     fi
   else
     if [[ "$ok" == "true" ]]; then
-      echo "OK [$COMMAND] job=$JOB_ID duration=${duration}s"
+      printf 'OK [%s] job=%s duration=%ss\n' "$COMMAND" "$JOB_ID" "$duration"
     else
-      echo "ERROR [$COMMAND] code=$err_code message=$err_msg" >&2
+      printf 'ERROR [%s] code=%s message=%s\n' "$COMMAND" "$err_code" "$err_msg" >&2
     fi
   fi
+
   exit "$exit_code"
 }
 
-require_arg() {
-  local name="$1" value="$2"
-  if [[ -z "$value" ]]; then
-    echo "missing required arg: $name" >&2
-    exit 2
+fail() {
+  local exit_code="$1"
+  local err_code="$2"
+  local err_msg="$3"
+  local artifacts_json="${4-}"
+  local data_json="${5-}"
+  [[ -n "$artifacts_json" ]] || artifacts_json='[]'
+  [[ -n "$data_json" ]] || data_json='{}'
+  emit_result false "$exit_code" "$(duration_sec)" "$err_code" "$err_msg" "$artifacts_json" "$data_json"
+}
+
+require_value() {
+  local flag="$1"
+  local value="${2:-}"
+  [[ -n "$value" ]] || fail 2 "missing_argument" "missing required value for ${flag}"
+}
+
+python_realpath() {
+  python3 - <<'PY' "$1"
+import os
+import sys
+print(os.path.realpath(sys.argv[1]))
+PY
+}
+
+path_exists() {
+  [[ -e "$1" ]]
+}
+
+require_path_exists() {
+  local path="$1"
+  local label="$2"
+  path_exists "$path" || fail 3 "missing_path" "${label} not found: ${path}"
+}
+
+is_path_within() {
+  python3 - <<'PY' "$1" "$2"
+import os
+import sys
+
+root = os.path.realpath(sys.argv[1])
+target = os.path.realpath(sys.argv[2])
+
+try:
+    ok = os.path.commonpath([root, target]) == root
+except ValueError:
+    ok = False
+
+sys.exit(0 if ok else 1)
+PY
+}
+
+ensure_path_within() {
+  local root="$1"
+  local target="$2"
+  local label="$3"
+  is_path_within "$root" "$target" || fail 3 "path_escape" "${label} escapes allowed root: ${target}"
+}
+
+safe_mkdir() {
+  mkdir -p "$1"
+}
+
+resolve_input_path() {
+  local root="$1"
+  local value="$2"
+  local label="$3"
+  local candidate
+
+  if [[ "$value" == /* ]]; then
+    candidate="$value"
+  else
+    candidate="${root}/${value}"
+  fi
+
+  require_path_exists "$candidate" "$label"
+  local real_candidate
+  real_candidate="$(python_realpath "$candidate")"
+  ensure_path_within "$root" "$real_candidate" "$label"
+  printf '%s\n' "$real_candidate"
+}
+
+resolve_controlled_output_path() {
+  local base="$1"
+  local requested="$2"
+  local label="$3"
+  local candidate
+
+  if [[ -z "$requested" ]]; then
+    printf '%s\n' "$base"
+    return
+  fi
+
+  if [[ "$requested" == /* ]]; then
+    if [[ "$MODE" == "hardened" ]]; then
+      fail 2 "unsafe_output_path" "${label} must stay under worker-owned directories"
+    fi
+    candidate="$requested"
+  else
+    candidate="${base}/${requested}"
+  fi
+
+  safe_mkdir "$(dirname "$candidate")"
+  local real_base real_candidate
+  real_base="$(python_realpath "$base")"
+  real_candidate="$(python_realpath "$candidate")"
+
+  if [[ "$MODE" == "hardened" ]]; then
+    ensure_path_within "$real_base" "$real_candidate" "$label"
+  fi
+
+  printf '%s\n' "$real_candidate"
+}
+
+profile_file_path() {
+  local profile_name="$1"
+  printf '%s/%s.json\n' "$PROJECTS_DIR" "$profile_name"
+}
+
+profile_json_scalar() {
+  python3 - <<'PY' "$PROFILE_PATH" "$1"
+import json
+import sys
+
+with open(sys.argv[1], 'r', encoding='utf-8') as handle:
+    data = json.load(handle)
+
+value = data.get(sys.argv[2], "")
+if value is None:
+    value = ""
+print(value)
+PY
+}
+
+profile_json_array_contains() {
+  python3 - <<'PY' "$PROFILE_PATH" "$1" "$2"
+import json
+import sys
+
+with open(sys.argv[1], 'r', encoding='utf-8') as handle:
+    data = json.load(handle)
+
+values = data.get(sys.argv[2]) or []
+candidate = sys.argv[3]
+sys.exit(0 if candidate in values else 1)
+PY
+}
+
+profile_json_array_json() {
+  python3 - <<'PY' "$PROFILE_PATH" "$1"
+import json
+import sys
+
+with open(sys.argv[1], 'r', encoding='utf-8') as handle:
+    data = json.load(handle)
+
+print(json.dumps(data.get(sys.argv[2]) or []))
+PY
+}
+
+load_project_profile() {
+  [[ -n "$PROJECT_PROFILE" ]] || return 0
+
+  PROFILE_PATH="$(profile_file_path "$PROJECT_PROFILE")"
+  require_path_exists "$PROFILE_PATH" "project profile"
+
+  PROFILE_ROOT="$(profile_json_scalar projectRoot)"
+  require_value "projectRoot" "$PROFILE_ROOT"
+  PROFILE_ROOT="$(python_realpath "$PROFILE_ROOT")"
+  require_path_exists "$PROFILE_ROOT" "profile projectRoot"
+
+  PROFILE_WORKSPACE="$(profile_json_scalar workspacePath)"
+  PROFILE_PROJECT="$(profile_json_scalar projectPath)"
+  PROFILE_DEFAULT_SCHEME="$(profile_json_scalar defaultScheme)"
+  PROFILE_DEFAULT_DESTINATION="$(profile_json_scalar defaultDestination)"
+  PROFILE_DEFAULT_SIMULATOR="$(profile_json_scalar defaultSimulator)"
+  PROFILE_BUNDLE_ID="$(profile_json_scalar bundleId)"
+
+  if [[ -n "$PROFILE_WORKSPACE" && -n "$PROFILE_PROJECT" ]]; then
+    fail 2 "invalid_profile" "profile must define only one of workspacePath or projectPath"
+  fi
+
+  if [[ -z "$PROFILE_WORKSPACE" && -z "$PROFILE_PROJECT" ]]; then
+    :
+  elif [[ -n "$PROFILE_WORKSPACE" ]]; then
+    PROFILE_WORKSPACE="$(resolve_input_path "$PROFILE_ROOT" "$PROFILE_WORKSPACE" "profile workspace")"
+  else
+    PROFILE_PROJECT="$(resolve_input_path "$PROFILE_ROOT" "$PROFILE_PROJECT" "profile project")"
   fi
 }
 
 parse_common_flags() {
   REMAINING_ARGS=()
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --json) JSON_MODE=1; shift ;;
-      --job-id) JOB_ID="$2"; shift 2 ;;
-      --project-root) PROJECT_ROOT="$2"; shift 2 ;;
-      *) REMAINING_ARGS+=("$1"); shift ;;
+      --json)
+        JSON_MODE=1
+        shift
+        ;;
+      --mode)
+        require_value "--mode" "${2:-}"
+        MODE="$2"
+        shift 2
+        ;;
+      --job-id)
+        require_value "--job-id" "${2:-}"
+        JOB_ID="$2"
+        shift 2
+        ;;
+      --project-profile)
+        require_value "--project-profile" "${2:-}"
+        PROJECT_PROFILE="$2"
+        shift 2
+        ;;
+      --project-root)
+        require_value "--project-root" "${2:-}"
+        PROJECT_ROOT="$2"
+        PROJECT_ROOT_EXPLICIT=1
+        shift 2
+        ;;
+      --help|-h)
+        print_usage
+        exit 0
+        ;;
+      *)
+        REMAINING_ARGS+=("$1")
+        shift
+        ;;
     esac
   done
+
+  [[ "$MODE" == "dev" || "$MODE" == "hardened" ]] || fail 2 "invalid_mode" "mode must be dev or hardened"
+  if [[ -n "$JOB_ID" ]]; then
+    sanitize_job_id "$JOB_ID" || fail 2 "invalid_job_id" "job id must match [A-Za-z0-9._-]{1,64}"
+  fi
 }
 
-ensure_dirs
-parse_common_flags "$@"
-set -- "${REMAINING_ARGS[@]}"
-[[ -n "$JOB_ID" ]] || JOB_ID="$(gen_job_id)"
-JOB_PATH="${JOB_DIR}/${JOB_ID}"
-JOB_LOG_PATH="${LOG_DIR}/${JOB_ID}"
-JOB_ARTIFACT_PATH="${ARTIFACT_DIR}/${JOB_ID}"
-mkdir -p "$JOB_PATH" "$JOB_LOG_PATH" "$JOB_ARTIFACT_PATH"
-START_TS="$(now_epoch)"
+setup_job_dirs() {
+  ensure_base_dirs
 
-cmd_doctor() {
-  command -v xcodebuild >/dev/null 2>&1 || emit_result false 3 0.0 "missing_xcodebuild" "xcodebuild not found"
-  local data_json
-  data_json="{\"macOSVersion\":$(json_escape "$(sw_vers -productVersion)"),\"xcodeVersion\":$(json_escape "$(xcodebuild -version 2>/dev/null | tr '\n' ';' | xargs)"),\"developerDir\":$(json_escape "$(xcode-select -p 2>/dev/null || true)"),\"projectRoot\":$(json_escape "$PROJECT_ROOT") }"
-  local duration=$(( $(now_epoch) - START_TS ))
-  emit_result true 0 "$duration" "" "" "[]" "$data_json"
+  if [[ -z "$JOB_ID" ]]; then
+    JOB_ID="$(gen_job_id)"
+  fi
+
+  JOB_PATH="${JOB_ROOT}/${JOB_ID}"
+  JOB_LOG_PATH="${LOG_ROOT}/${JOB_ID}"
+  JOB_ARTIFACT_PATH="${ARTIFACT_ROOT}/${JOB_ID}"
+
+  safe_mkdir "$JOB_PATH"
+  safe_mkdir "$JOB_LOG_PATH"
+  safe_mkdir "$JOB_ARTIFACT_PATH"
 }
 
-cmd_build() {
-  local scheme="" workspace="" project="" configuration="Debug" destination="platform=macOS" derived_data=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --scheme) scheme="$2"; shift 2 ;;
-      --workspace) workspace="$2"; shift 2 ;;
-      --project) project="$2"; shift 2 ;;
-      --configuration) configuration="$2"; shift 2 ;;
-      --destination) destination="$2"; shift 2 ;;
-      --derived-data) derived_data="$2"; shift 2 ;;
-      *) echo "unknown arg: $1" >&2; exit 2 ;;
-    esac
-  done
-  require_arg --scheme "$scheme"
-  [[ -n "$workspace" || -n "$project" ]] || { echo "must provide --workspace or --project" >&2; exit 2; }
-  [[ -z "$workspace" || -z "$project" ]] || { echo "provide only one of --workspace or --project" >&2; exit 2; }
-  [[ -n "$derived_data" ]] || derived_data="${JOB_PATH}/DerivedData"
-  mkdir -p "$derived_data"
-  local log_file="${JOB_LOG_PATH}/build.log" status data_json artifacts_json
-  pushd "$PROJECT_ROOT" >/dev/null || emit_result false 3 0.0 "invalid_project_root" "project root not found: $PROJECT_ROOT"
-  local args=(build -scheme "$scheme" -configuration "$configuration" -destination "$destination" -derivedDataPath "$derived_data")
-  if [[ -n "$workspace" ]]; then args=(-workspace "$workspace" "${args[@]}"); else args=(-project "$project" "${args[@]}"); fi
+resolve_project_root() {
+  if [[ -n "$PROJECT_PROFILE" ]]; then
+    PROJECT_ROOT="$PROFILE_ROOT"
+  elif [[ -z "$PROJECT_ROOT" ]]; then
+    PROJECT_ROOT="$DEFAULT_PROJECT_ROOT"
+  fi
+
+  require_value "--project-root or --project-profile" "$PROJECT_ROOT"
+  require_path_exists "$PROJECT_ROOT" "project root"
+  PROJECT_ROOT="$(python_realpath "$PROJECT_ROOT")"
+
+  if [[ "$MODE" == "hardened" && -z "$PROJECT_PROFILE" ]]; then
+    fail 2 "profile_required" "hardened mode requires --project-profile"
+  fi
+
+  if [[ "$MODE" == "hardened" && "$PROJECT_ROOT_EXPLICIT" -eq 1 ]]; then
+    fail 2 "project_root_rejected" "--project-root is not allowed in hardened mode"
+  fi
+}
+
+resolve_workspace_or_project() {
+  local workspace_input="$1"
+  local project_input="$2"
+  local command_label="$3"
+
+  if [[ "$MODE" == "hardened" && ( -n "$workspace_input" || -n "$project_input" ) ]]; then
+    fail 2 "override_rejected" "${command_label} does not allow --workspace or --project overrides in hardened mode"
+  fi
+
+  if [[ -n "$PROJECT_PROFILE" ]]; then
+    if [[ -n "$PROFILE_WORKSPACE" ]]; then
+      RESOLVED_WORKSPACE="$PROFILE_WORKSPACE"
+      RESOLVED_PROJECT=""
+    else
+      RESOLVED_WORKSPACE=""
+      RESOLVED_PROJECT="$PROFILE_PROJECT"
+    fi
+  else
+    if [[ -n "$workspace_input" && -n "$project_input" ]]; then
+      fail 2 "conflicting_arguments" "provide only one of --workspace or --project"
+    fi
+    if [[ -z "$workspace_input" && -z "$project_input" ]]; then
+      fail 2 "missing_argument" "must provide --workspace or --project"
+    fi
+
+    if [[ -n "$workspace_input" ]]; then
+      RESOLVED_WORKSPACE="$(resolve_input_path "$PROJECT_ROOT" "$workspace_input" "workspace")"
+      RESOLVED_PROJECT=""
+    else
+      RESOLVED_WORKSPACE=""
+      RESOLVED_PROJECT="$(resolve_input_path "$PROJECT_ROOT" "$project_input" "project")"
+    fi
+  fi
+
+  if [[ -z "$RESOLVED_WORKSPACE" && -z "$RESOLVED_PROJECT" ]]; then
+    fail 2 "missing_project_target" "${command_label} requires a workspace or project"
+  fi
+}
+
+resolve_scheme() {
+  local requested="$1"
+  if [[ -n "$requested" ]]; then
+    RESOLVED_SCHEME="$requested"
+  else
+    RESOLVED_SCHEME="$PROFILE_DEFAULT_SCHEME"
+  fi
+
+  require_value "--scheme" "$RESOLVED_SCHEME"
+
+  if [[ "$MODE" == "hardened" ]]; then
+    profile_json_array_contains allowedSchemes "$RESOLVED_SCHEME" || fail 2 "scheme_not_allowed" "scheme is not allowed by profile: ${RESOLVED_SCHEME}"
+  fi
+}
+
+resolve_destination() {
+  local requested="$1"
+  local fallback="$2"
+
+  if [[ -n "$requested" ]]; then
+    RESOLVED_DESTINATION="$requested"
+  elif [[ -n "$PROFILE_DEFAULT_DESTINATION" ]]; then
+    RESOLVED_DESTINATION="$PROFILE_DEFAULT_DESTINATION"
+  else
+    RESOLVED_DESTINATION="$fallback"
+  fi
+
+  require_value "--destination" "$RESOLVED_DESTINATION"
+
+  if [[ "$MODE" == "hardened" ]]; then
+    profile_json_array_contains allowedDestinations "$RESOLVED_DESTINATION" || fail 2 "destination_not_allowed" "destination is not allowed by profile: ${RESOLVED_DESTINATION}"
+  fi
+}
+
+resolve_simulator_name() {
+  local requested="$1"
+
+  if [[ -n "$requested" ]]; then
+    RESOLVED_SIMULATOR="$requested"
+  else
+    RESOLVED_SIMULATOR="$PROFILE_DEFAULT_SIMULATOR"
+  fi
+
+  require_value "--simulator" "$RESOLVED_SIMULATOR"
+
+  if [[ "$MODE" == "hardened" ]]; then
+    profile_json_array_contains allowedSimulators "$RESOLVED_SIMULATOR" || fail 2 "simulator_not_allowed" "simulator is not allowed by profile: ${RESOLVED_SIMULATOR}"
+  fi
+}
+
+tool_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+require_tool() {
+  local tool="$1"
+  tool_exists "$tool" || fail 3 "missing_tool" "${tool} not found"
+}
+
+run_in_project_root() {
+  local log_file="$1"
+  shift
+  local -a args=("$@")
+  local status=0
+
+  pushd "$PROJECT_ROOT" >/dev/null || fail 3 "invalid_project_root" "project root not found: $PROJECT_ROOT"
   set +e
   xcodebuild "${args[@]}" >"$log_file" 2>&1
   status=$?
   set -e
   popd >/dev/null || true
-  artifacts_json="[$(json_escape "$log_file")]"
-  data_json="{\"scheme\":$(json_escape "$scheme"),\"configuration\":$(json_escape "$configuration"),\"destination\":$(json_escape "$destination"),\"derivedDataPath\":$(json_escape "$derived_data") }"
-  local duration=$(( $(now_epoch) - START_TS ))
-  [[ $status -eq 0 ]] || emit_result false 4 "$duration" "xcodebuild_failed" "xcodebuild exited with status $status" "$artifacts_json" "$data_json"
-  emit_result true 0 "$duration" "" "" "$artifacts_json" "$data_json"
+  return "$status"
 }
 
-cmd_test() {
-  local scheme="" workspace="" project="" destination="platform=macOS" result_bundle="${JOB_ARTIFACT_PATH}/TestResults.xcresult"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --scheme) scheme="$2"; shift 2 ;;
-      --workspace) workspace="$2"; shift 2 ;;
-      --project) project="$2"; shift 2 ;;
-      --destination) destination="$2"; shift 2 ;;
-      --result-bundle) result_bundle="$2"; shift 2 ;;
-      *) echo "unknown arg: $1" >&2; exit 2 ;;
-    esac
-  done
-  require_arg --scheme "$scheme"
-  [[ -n "$workspace" || -n "$project" ]] || { echo "must provide --workspace or --project" >&2; exit 2; }
-  local log_file="${JOB_LOG_PATH}/test.log" status data_json artifacts_json
-  pushd "$PROJECT_ROOT" >/dev/null || emit_result false 3 0.0 "invalid_project_root" "project root not found: $PROJECT_ROOT"
-  local args=(test -scheme "$scheme" -destination "$destination" -resultBundlePath "$result_bundle")
-  if [[ -n "$workspace" ]]; then args=(-workspace "$workspace" "${args[@]}"); else args=(-project "$project" "${args[@]}"); fi
-  set +e
-  xcodebuild "${args[@]}" >"$log_file" 2>&1
-  status=$?
-  set -e
-  popd >/dev/null || true
-  artifacts_json="[$(json_escape "$log_file"),$(json_escape "$result_bundle")]"
-  data_json="{\"scheme\":$(json_escape "$scheme"),\"destination\":$(json_escape "$destination") }"
-  local duration=$(( $(now_epoch) - START_TS ))
-  [[ $status -eq 0 ]] || emit_result false 5 "$duration" "tests_failed" "xcodebuild test exited with status $status" "$artifacts_json" "$data_json"
-  emit_result true 0 "$duration" "" "" "$artifacts_json" "$data_json"
+build_common_data_json() {
+  local extra="$1"
+  printf '{"mode":%s,"projectProfile":%s,"projectRoot":%s,%s}' \
+    "$(json_escape "$MODE")" \
+    "$(json_escape "$PROJECT_PROFILE")" \
+    "$(json_escape "$PROJECT_ROOT")" \
+    "$extra"
 }
 
 resolve_sim_udid() {
-  local sim_name="$1"
-  xcrun simctl list devices available | grep -F "$sim_name" | head -n1 | sed -n 's/.*(\([A-F0-9-]*\)).*/\1/p'
+  python3 - <<'PY' "$1"
+import json
+import subprocess
+import sys
+
+sim_name = sys.argv[1]
+result = subprocess.run(
+    ["xcrun", "simctl", "list", "devices", "available", "--json"],
+    check=True,
+    capture_output=True,
+    text=True,
+)
+payload = json.loads(result.stdout)
+
+matches = []
+for runtime_devices in payload.get("devices", {}).values():
+    for device in runtime_devices:
+        if not device.get("isAvailable", True):
+            continue
+        if device.get("name") == sim_name:
+            matches.append(device)
+
+booted = next((item for item in matches if item.get("state") == "Booted"), None)
+selected = booted or (matches[0] if matches else None)
+if not selected:
+    sys.exit(1)
+
+print(selected["udid"])
+PY
+}
+
+boot_simulator_if_needed() {
+  local udid="$1"
+  set +e
+  xcrun simctl boot "$udid" >/dev/null 2>&1
+  local boot_status=$?
+  set -e
+  if [[ $boot_status -ne 0 && $boot_status -ne 149 ]]; then
+    fail 6 "simulator_boot_failed" "failed to boot simulator ${udid}"
+  fi
+
+  xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 || fail 6 "simulator_not_ready" "simulator did not reach booted state: ${udid}"
+}
+
+cmd_doctor() {
+  require_tool xcodebuild
+  require_tool xcode-select
+  require_tool sw_vers
+
+  local profiles_json="[]"
+  if [[ -d "$PROJECTS_DIR" ]]; then
+    profiles_json="$(python3 - <<'PY' "$PROJECTS_DIR"
+import json
+import os
+import sys
+
+profiles_dir = sys.argv[1]
+profiles = []
+for name in sorted(os.listdir(profiles_dir)):
+    if name.endswith(".json"):
+        profiles.append(name[:-5])
+print(json.dumps(profiles))
+PY
+)"
+  fi
+
+  local data_json
+  data_json="$(python3 - <<'PY' \
+    "$(sw_vers -productVersion)" \
+    "$(xcodebuild -version 2>/dev/null | tr '\n' ';' | sed 's/;*$//')" \
+    "$(xcode-select -p 2>/dev/null || true)" \
+    "$MODE" \
+    "$PROJECT_PROFILE" \
+    "$PROJECT_ROOT" \
+    "$WORKER_HOME" \
+    "$WORK_ROOT" \
+    "$profiles_json"
+import json
+import sys
+
+profiles = json.loads(sys.argv[9])
+payload = {
+    "macOSVersion": sys.argv[1],
+    "xcodeVersion": sys.argv[2],
+    "developerDir": sys.argv[3],
+    "mode": sys.argv[4],
+    "projectProfile": sys.argv[5],
+    "projectRoot": sys.argv[6],
+    "workerHome": sys.argv[7],
+    "workRoot": sys.argv[8],
+    "profiles": profiles,
+}
+print(json.dumps(payload, separators=(",", ":")))
+PY
+)"
+  emit_result true 0 "$(duration_sec)" "" "" "$(empty_json_array)" "$data_json"
+}
+
+cmd_build() {
+  require_tool xcodebuild
+  local scheme=""
+  local workspace=""
+  local project=""
+  local configuration="Debug"
+  local destination=""
+  local derived_data_arg=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scheme) require_value "--scheme" "${2:-}"; scheme="$2"; shift 2 ;;
+      --workspace) require_value "--workspace" "${2:-}"; workspace="$2"; shift 2 ;;
+      --project) require_value "--project" "${2:-}"; project="$2"; shift 2 ;;
+      --configuration) require_value "--configuration" "${2:-}"; configuration="$2"; shift 2 ;;
+      --destination) require_value "--destination" "${2:-}"; destination="$2"; shift 2 ;;
+      --derived-data) require_value "--derived-data" "${2:-}"; derived_data_arg="$2"; shift 2 ;;
+      *) fail 2 "unknown_argument" "unknown build argument: $1" ;;
+    esac
+  done
+
+  resolve_workspace_or_project "$workspace" "$project" "build"
+  resolve_scheme "$scheme"
+  resolve_destination "$destination" "platform=macOS"
+  local derived_data_path
+  derived_data_path="$(resolve_controlled_output_path "$JOB_PATH" "${derived_data_arg:-DerivedData}" "derived data")"
+  safe_mkdir "$derived_data_path"
+
+  local log_file="${JOB_LOG_PATH}/build.log"
+  local -a args=(build -scheme "$RESOLVED_SCHEME" -configuration "$configuration" -destination "$RESOLVED_DESTINATION" -derivedDataPath "$derived_data_path")
+  if [[ -n "$RESOLVED_WORKSPACE" ]]; then
+    args=(-workspace "$RESOLVED_WORKSPACE" "${args[@]}")
+  else
+    args=(-project "$RESOLVED_PROJECT" "${args[@]}")
+  fi
+
+  local status=0
+  set +e
+  run_in_project_root "$log_file" "${args[@]}"
+  status=$?
+  set -e
+
+  local artifacts_json
+  artifacts_json="$(printf '[%s]' "$(json_escape "$log_file")")"
+  local data_json
+  data_json="$(build_common_data_json "\"scheme\":$(json_escape "$RESOLVED_SCHEME"),\"configuration\":$(json_escape "$configuration"),\"destination\":$(json_escape "$RESOLVED_DESTINATION"),\"derivedDataPath\":$(json_escape "$derived_data_path"),\"workspace\":$(json_escape "$RESOLVED_WORKSPACE"),\"project\":$(json_escape "$RESOLVED_PROJECT")")"
+  [[ $status -eq 0 ]] || fail 4 "xcodebuild_failed" "xcodebuild build exited with status $status" "$artifacts_json" "$data_json"
+  emit_result true 0 "$(duration_sec)" "" "" "$artifacts_json" "$data_json"
+}
+
+cmd_test() {
+  require_tool xcodebuild
+  local scheme=""
+  local workspace=""
+  local project=""
+  local destination=""
+  local result_bundle_arg=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scheme) require_value "--scheme" "${2:-}"; scheme="$2"; shift 2 ;;
+      --workspace) require_value "--workspace" "${2:-}"; workspace="$2"; shift 2 ;;
+      --project) require_value "--project" "${2:-}"; project="$2"; shift 2 ;;
+      --destination) require_value "--destination" "${2:-}"; destination="$2"; shift 2 ;;
+      --result-bundle) require_value "--result-bundle" "${2:-}"; result_bundle_arg="$2"; shift 2 ;;
+      *) fail 2 "unknown_argument" "unknown test argument: $1" ;;
+    esac
+  done
+
+  resolve_workspace_or_project "$workspace" "$project" "test"
+  resolve_scheme "$scheme"
+  resolve_destination "$destination" "platform=macOS"
+  local result_bundle_path
+  result_bundle_path="$(resolve_controlled_output_path "$JOB_ARTIFACT_PATH" "${result_bundle_arg:-TestResults.xcresult}" "result bundle")"
+
+  local log_file="${JOB_LOG_PATH}/test.log"
+  local -a args=(test -scheme "$RESOLVED_SCHEME" -destination "$RESOLVED_DESTINATION" -resultBundlePath "$result_bundle_path")
+  if [[ -n "$RESOLVED_WORKSPACE" ]]; then
+    args=(-workspace "$RESOLVED_WORKSPACE" "${args[@]}")
+  else
+    args=(-project "$RESOLVED_PROJECT" "${args[@]}")
+  fi
+
+  local status=0
+  set +e
+  run_in_project_root "$log_file" "${args[@]}"
+  status=$?
+  set -e
+
+  local artifacts_json
+  artifacts_json="$(printf '[%s,%s]' "$(json_escape "$log_file")" "$(json_escape "$result_bundle_path")")"
+  local data_json
+  data_json="$(build_common_data_json "\"scheme\":$(json_escape "$RESOLVED_SCHEME"),\"destination\":$(json_escape "$RESOLVED_DESTINATION"),\"resultBundlePath\":$(json_escape "$result_bundle_path"),\"workspace\":$(json_escape "$RESOLVED_WORKSPACE"),\"project\":$(json_escape "$RESOLVED_PROJECT")")"
+  [[ $status -eq 0 ]] || fail 5 "tests_failed" "xcodebuild test exited with status $status" "$artifacts_json" "$data_json"
+  emit_result true 0 "$(duration_sec)" "" "" "$artifacts_json" "$data_json"
 }
 
 cmd_ui_test() {
-  local scheme="" workspace="" project="" sim_name="iPhone 16" result_bundle="${JOB_ARTIFACT_PATH}/UITestResults.xcresult"
+  require_tool xcodebuild
+  require_tool xcrun
+  local scheme=""
+  local workspace=""
+  local project=""
+  local simulator=""
+  local result_bundle_arg=""
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --scheme) scheme="$2"; shift 2 ;;
-      --workspace) workspace="$2"; shift 2 ;;
-      --project) project="$2"; shift 2 ;;
-      --simulator) sim_name="$2"; shift 2 ;;
-      --result-bundle) result_bundle="$2"; shift 2 ;;
-      *) echo "unknown arg: $1" >&2; exit 2 ;;
+      --scheme) require_value "--scheme" "${2:-}"; scheme="$2"; shift 2 ;;
+      --workspace) require_value "--workspace" "${2:-}"; workspace="$2"; shift 2 ;;
+      --project) require_value "--project" "${2:-}"; project="$2"; shift 2 ;;
+      --simulator) require_value "--simulator" "${2:-}"; simulator="$2"; shift 2 ;;
+      --result-bundle) require_value "--result-bundle" "${2:-}"; result_bundle_arg="$2"; shift 2 ;;
+      *) fail 2 "unknown_argument" "unknown ui-test argument: $1" ;;
     esac
   done
-  require_arg --scheme "$scheme"
-  local udid
-  udid="$(resolve_sim_udid "$sim_name")"
-  [[ -n "$udid" ]] || emit_result false 6 0.0 "simulator_not_found" "could not find simulator named $sim_name"
-  xcrun simctl boot "$udid" >/dev/null 2>&1 || true
-  open -a Simulator >/dev/null 2>&1 || true
-  local destination="platform=iOS Simulator,id=${udid}"
-  local log_file="${JOB_LOG_PATH}/ui-test.log" status data_json artifacts_json
-  pushd "$PROJECT_ROOT" >/dev/null || emit_result false 3 0.0 "invalid_project_root" "project root not found: $PROJECT_ROOT"
-  local args=(test -scheme "$scheme" -destination "$destination" -resultBundlePath "$result_bundle")
-  if [[ -n "$workspace" ]]; then args=(-workspace "$workspace" "${args[@]}"); else args=(-project "$project" "${args[@]}"); fi
+
+  resolve_workspace_or_project "$workspace" "$project" "ui-test"
+  resolve_scheme "$scheme"
+  resolve_simulator_name "$simulator"
+  local result_bundle_path
+  result_bundle_path="$(resolve_controlled_output_path "$JOB_ARTIFACT_PATH" "${result_bundle_arg:-UITestResults.xcresult}" "result bundle")"
+
+  local udid=""
   set +e
-  xcodebuild "${args[@]}" >"$log_file" 2>&1
+  udid="$(resolve_sim_udid "$RESOLVED_SIMULATOR")"
+  local sim_status=$?
+  set -e
+  [[ $sim_status -eq 0 && -n "$udid" ]] || fail 6 "simulator_not_found" "could not find available simulator named ${RESOLVED_SIMULATOR}"
+
+  boot_simulator_if_needed "$udid"
+  local destination="platform=iOS Simulator,id=${udid}"
+
+  if [[ "$MODE" == "hardened" ]]; then
+    profile_json_array_contains allowedDestinations "$destination" || fail 2 "destination_not_allowed" "resolved simulator destination is not allowed by profile: ${destination}"
+  fi
+
+  local log_file="${JOB_LOG_PATH}/ui-test.log"
+  local -a args=(test -scheme "$RESOLVED_SCHEME" -destination "$destination" -resultBundlePath "$result_bundle_path")
+  if [[ -n "$RESOLVED_WORKSPACE" ]]; then
+    args=(-workspace "$RESOLVED_WORKSPACE" "${args[@]}")
+  else
+    args=(-project "$RESOLVED_PROJECT" "${args[@]}")
+  fi
+
+  local status=0
+  set +e
+  run_in_project_root "$log_file" "${args[@]}"
   status=$?
   set -e
-  popd >/dev/null || true
-  artifacts_json="[$(json_escape "$log_file"),$(json_escape "$result_bundle")]"
-  data_json="{\"scheme\":$(json_escape "$scheme"),\"simulator\":$(json_escape "$sim_name"),\"udid\":$(json_escape "$udid") }"
-  local duration=$(( $(now_epoch) - START_TS ))
-  [[ $status -eq 0 ]] || emit_result false 5 "$duration" "ui_tests_failed" "xcodebuild ui-test exited with status $status" "$artifacts_json" "$data_json"
-  emit_result true 0 "$duration" "" "" "$artifacts_json" "$data_json"
+
+  local artifacts_json
+  artifacts_json="$(printf '[%s,%s]' "$(json_escape "$log_file")" "$(json_escape "$result_bundle_path")")"
+  local data_json
+  data_json="$(build_common_data_json "\"scheme\":$(json_escape "$RESOLVED_SCHEME"),\"simulator\":$(json_escape "$RESOLVED_SIMULATOR"),\"destination\":$(json_escape "$destination"),\"udid\":$(json_escape "$udid"),\"resultBundlePath\":$(json_escape "$result_bundle_path"),\"workspace\":$(json_escape "$RESOLVED_WORKSPACE"),\"project\":$(json_escape "$RESOLVED_PROJECT")")"
+  [[ $status -eq 0 ]] || fail 5 "ui_tests_failed" "xcodebuild test exited with status $status" "$artifacts_json" "$data_json"
+  emit_result true 0 "$(duration_sec)" "" "" "$artifacts_json" "$data_json"
 }
 
 cmd_launch() {
   local app_path=""
-  while [[ $# -gt 0 ]]; do case "$1" in --app) app_path="$2"; shift 2 ;; *) echo "unknown arg: $1" >&2; exit 2 ;; esac; done
-  require_arg --app "$app_path"
-  set +e; open "$app_path" >/dev/null 2>&1; local status=$?; set -e
-  local duration=$(( $(now_epoch) - START_TS ))
-  [[ $status -eq 0 ]] || emit_result false 7 "$duration" "launch_failed" "failed to launch app: $app_path"
-  emit_result true 0 "$duration" "" "" "[]" "{\"app\":$(json_escape "$app_path") }"
+  local bundle_id=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --app) require_value "--app" "${2:-}"; app_path="$2"; shift 2 ;;
+      --bundle-id) require_value "--bundle-id" "${2:-}"; bundle_id="$2"; shift 2 ;;
+      *) fail 2 "unknown_argument" "unknown launch argument: $1" ;;
+    esac
+  done
+
+  if [[ -n "$app_path" && -n "$bundle_id" ]]; then
+    fail 2 "conflicting_arguments" "provide only one of --app or --bundle-id"
+  fi
+
+  if [[ -z "$app_path" && -z "$bundle_id" && -n "$PROFILE_BUNDLE_ID" ]]; then
+    bundle_id="$PROFILE_BUNDLE_ID"
+  fi
+
+  if [[ "$MODE" == "hardened" && -n "$app_path" ]]; then
+    fail 2 "app_path_rejected" "--app is not allowed in hardened mode"
+  fi
+
+  if [[ "$MODE" == "hardened" && -n "$bundle_id" ]]; then
+    [[ -n "$PROFILE_BUNDLE_ID" ]] || fail 2 "bundle_id_rejected" "--bundle-id is not allowed unless the profile defines bundleId"
+    [[ "$bundle_id" == "$PROFILE_BUNDLE_ID" ]] || fail 2 "bundle_id_rejected" "bundle id is not allowed by profile: ${bundle_id}"
+  fi
+
+  local status=0
+  if [[ -n "$bundle_id" ]]; then
+    set +e
+    open -b "$bundle_id" >/dev/null 2>&1
+    status=$?
+    set -e
+    [[ $status -eq 0 ]] || fail 7 "launch_failed" "failed to launch bundle id: ${bundle_id}"
+    emit_result true 0 "$(duration_sec)" "" "" "$(empty_json_array)" "$(build_common_data_json "\"bundleId\":$(json_escape "$bundle_id")")"
+  fi
+
+  require_value "--app or profile bundleId" "$app_path"
+  require_path_exists "$app_path" "app bundle"
+  local real_app
+  real_app="$(python_realpath "$app_path")"
+  set +e
+  open "$real_app" >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ $status -eq 0 ]] || fail 7 "launch_failed" "failed to launch app: ${real_app}"
+  emit_result true 0 "$(duration_sec)" "" "" "$(empty_json_array)" "$(build_common_data_json "\"app\":$(json_escape "$real_app")")"
 }
 
 cmd_screenshot() {
-  local out="${JOB_ARTIFACT_PATH}/screenshot-$(date +%Y%m%d-%H%M%S).png"
-  while [[ $# -gt 0 ]]; do case "$1" in --out) out="$2"; shift 2 ;; *) echo "unknown arg: $1" >&2; exit 2 ;; esac; done
-  [[ "$out" = /* ]] || out="${JOB_ARTIFACT_PATH}/${out}"
-  mkdir -p "$(dirname "$out")"
-  set +e; screencapture -x "$out"; local status=$?; set -e
-  local duration=$(( $(now_epoch) - START_TS ))
-  [[ $status -eq 0 ]] || emit_result false 8 "$duration" "screenshot_failed" "failed to capture screenshot"
-  emit_result true 0 "$duration" "" "" "[$(json_escape "$out")]" "{\"output\":$(json_escape "$out") }"
+  require_tool screencapture
+  local out_arg=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --out) require_value "--out" "${2:-}"; out_arg="$2"; shift 2 ;;
+      *) fail 2 "unknown_argument" "unknown screenshot argument: $1" ;;
+    esac
+  done
+
+  local output_path
+  output_path="$(resolve_controlled_output_path "$JOB_ARTIFACT_PATH" "${out_arg:-screenshot-$(date +%Y%m%d-%H%M%S).png}" "screenshot output")"
+  set +e
+  screencapture -x "$output_path"
+  local status=$?
+  set -e
+  [[ $status -eq 0 ]] || fail 8 "screenshot_failed" "failed to capture screenshot"
+  emit_result true 0 "$(duration_sec)" "" "" "[$(json_escape "$output_path")]" "$(build_common_data_json "\"output\":$(json_escape "$output_path")")"
 }
 
 cmd_collect_logs() {
+  require_tool log
   local interval="10m"
-  while [[ $# -gt 0 ]]; do case "$1" in --last) interval="$2"; shift 2 ;; *) echo "unknown arg: $1" >&2; exit 2 ;; esac; done
-  local out="${JOB_ARTIFACT_PATH}/unified.log"
-  set +e; log show --last "$interval" --style compact >"$out" 2>&1; local status=$?; set -e
-  local duration=$(( $(now_epoch) - START_TS ))
-  [[ $status -eq 0 ]] || emit_result false 8 "$duration" "log_collection_failed" "failed to collect logs"
-  emit_result true 0 "$duration" "" "" "[$(json_escape "$out")]" "{\"interval\":$(json_escape "$interval") }"
+  local out_arg=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --last) require_value "--last" "${2:-}"; interval="$2"; shift 2 ;;
+      --out) require_value "--out" "${2:-}"; out_arg="$2"; shift 2 ;;
+      *) fail 2 "unknown_argument" "unknown collect-logs argument: $1" ;;
+    esac
+  done
+
+  local output_path
+  output_path="$(resolve_controlled_output_path "$JOB_ARTIFACT_PATH" "${out_arg:-unified.log}" "log output")"
+  set +e
+  log show --last "$interval" --style compact >"$output_path" 2>&1
+  local status=$?
+  set -e
+  [[ $status -eq 0 ]] || fail 8 "log_collection_failed" "failed to collect logs"
+  emit_result true 0 "$(duration_sec)" "" "" "[$(json_escape "$output_path")]" "$(build_common_data_json "\"interval\":$(json_escape "$interval"),\"output\":$(json_escape "$output_path")")"
 }
 
-cmd_record_video() {
-  local duration=$(( $(now_epoch) - START_TS ))
-  emit_result false 9 "$duration" "unsupported" "record-video is not implemented in shell v1"
-}
+case "$COMMAND" in
+  ""|help|--help|-h)
+    print_usage
+    exit 0
+    ;;
+esac
+
+START_TS="$(now_epoch)"
+parse_common_flags "$@"
+if [[ ${#REMAINING_ARGS[@]} -gt 0 ]]; then
+  set -- "${REMAINING_ARGS[@]}"
+else
+  set --
+fi
+setup_job_dirs
+require_tool python3
+load_project_profile
+resolve_project_root
 
 case "$COMMAND" in
   doctor) cmd_doctor "$@" ;;
@@ -236,20 +952,7 @@ case "$COMMAND" in
   launch) cmd_launch "$@" ;;
   screenshot) cmd_screenshot "$@" ;;
   collect-logs) cmd_collect_logs "$@" ;;
-  record-video) cmd_record_video "$@" ;;
-  ""|help|--help|-h)
-    cat <<USAGE
-Usage: mac_worker <command> [--json] [--job-id ID] [--project-root PATH]
-Commands:
-  doctor
-  build --scheme NAME [--workspace FILE | --project FILE] [--configuration Debug|Release] [--destination DEST]
-  test --scheme NAME [--workspace FILE | --project FILE] [--destination DEST]
-  ui-test --scheme NAME [--workspace FILE | --project FILE] [--simulator NAME]
-  launch --app PATH
-  screenshot [--out FILE]
-  collect-logs [--last 10m]
-  record-video
-USAGE
+  *)
+    fail 2 "unknown_command" "unknown command: $COMMAND"
     ;;
-  *) echo "unknown command: $COMMAND" >&2; exit 9 ;;
 esac
