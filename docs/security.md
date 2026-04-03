@@ -36,6 +36,8 @@ This keeps the worker from becoming a general-purpose remote Xcode wrapper.
 - fixed internal recipes for analyzer and pipeline verbs
 - bounded long-running work through `run_id` plus polling instead of persistent sessions
 
+For `masterofdrums-pipeline`, the bounded run recipe stays shell-free by invoking a checked-in Python helper with an allowlisted interpreter and explicit Swift subcommands. The helper writes repo-local run logs and summaries so OpenClaw can inspect the run without shell access.
+
 This keeps repo inspection and pipeline debugging useful without turning SSH access into a general remote shell.
 
 ## SSH Gates

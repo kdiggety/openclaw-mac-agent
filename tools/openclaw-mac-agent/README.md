@@ -49,6 +49,17 @@ config/masterofdrums-pipeline.example.json
 
 and adapt the `validate-analyzer` and `pipeline_profiles.debug` recipes to match the real repo scripts that should be exposed remotely.
 
+The checked-in `masterofdrums-pipeline` example now targets the real app flow:
+
+- `validate-analyzer` calls `swift run MasterOfDrumsPipeline validate-audio-analyzer`
+- `run-pipeline --profile debug` calls [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/scripts/run-masterofdrums-pipeline-debug.py`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/scripts/run-masterofdrums-pipeline-debug.py), which orchestrates:
+  - `init-db`
+  - `enqueue-audio-ingest`
+  - `worker --stop-after-idle-polls 2`
+  - `list-jobs`
+  - `list-events`
+  - `list-artifacts`
+
 To generate a real `repos.json` for the dedicated Mac worker account, use:
 
 ```bash
@@ -87,6 +98,15 @@ and rejects anything that does not begin with `openclaw-mac-agent`.
 - `list-artifacts --root runs`
 
 instead of relying on persistent sessions.
+
+For the `masterofdrums-pipeline` debug profile, each run now writes repo-local files under `runs/<run-id>/`, including:
+
+- `stdout.log`
+- `stderr.log`
+- `status.json`
+- `steps/*.stdout.log`
+- `steps/*.stderr.log`
+- `artifacts/summary.json`
 
 ## Remote Smoke Test
 

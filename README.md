@@ -214,6 +214,11 @@ The wrapper reports `jobId` values and remote artifact paths in JSON. Direct `rs
 
 For broader repo inspection and bounded pipeline debugging over SSH, use `openclaw-mac-agent` with its own forced-command wrapper instead of overloading `mac_worker`.
 
+For `masterofdrums-pipeline`, the new `openclaw-mac-agent` flow now integrates with the real app CLI:
+
+- analyzer validation routes through `swift run MasterOfDrumsPipeline validate-audio-analyzer`
+- pipeline debug runs route through a helper that drives `init-db`, `enqueue-audio-ingest`, `worker`, and `list-*` commands while writing run logs under `runs/<run-id>/`
+
 For a simple Linux-side smoke test of that path, use:
 
 ```bash

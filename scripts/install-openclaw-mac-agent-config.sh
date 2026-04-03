@@ -52,24 +52,61 @@ cat > "${CONFIG_PATH}" <<EOF
       "recipes": {
         "validate-analyzer": {
           "argv": [
-            "{repo}/.venv/bin/python",
-            "{repo}/scripts/analyzer-wrapper.py",
-            "--input",
-            "{source_path}",
-            "--output",
+            "/usr/bin/env",
+            "swift",
+            "run",
+            "--scratch-path",
+            "{root_tmp}/swiftpm-validate",
+            "MasterOfDrumsPipeline",
+            "validate-audio-analyzer",
+            "--source-uri",
+            "{source_uri}",
+            "--source-type",
+            "file",
+            "--requested-by",
+            "openclaw-mac-agent",
+            "--output-path",
             "{root_tmp}/validate-analyzer-output.json"
           ],
+          "env": {
+            "PIPELINE_AUDIO_ANALYZER_COMMAND": "{repo}/.venv/bin/python3 ./scripts/analyzer-wrapper.py --input {input} --output {output}",
+            "PIPELINE_ANALYZER_PRIMARY_BACKEND_COMMAND": "{repo}/.venv/bin/python3 ./scripts/beat-this-backend.py --input {input} --output {output}",
+            "PIPELINE_ANALYZER_FALLBACK_BACKEND_COMMAND": "{repo}/.venv/bin/python3 ./scripts/backend-analyzer.py --input {input} --output {output}",
+            "PIPELINE_ANALYZER_FALLBACK_POLICY": "on-error-or-invalid",
+            "PIPELINE_ANALYZER_VALIDATION_MODE": "require-timing",
+            "PIPELINE_AUDIO_ANALYZER_TIMEOUT_SECONDS": "300",
+            "PIPELINE_AUDIO_ANALYZER_STDOUT_JSON": "false"
+          },
           "timeout_seconds": 60
         }
       },
       "pipeline_profiles": {
         "debug": {
           "argv": [
-            "{repo}/.venv/bin/python",
-            "{repo}/scripts/run_pipeline.py",
+            "/usr/bin/python3",
+            "{agent_repo}/scripts/run-masterofdrums-pipeline-debug.py",
+            "--repo-root",
+            "{repo}",
+            "--scratch-path",
+            "{run_dir}/swiftpm-debug",
+            "--requested-by",
+            "openclaw-mac-agent",
+            "--stop-after-idle-polls",
+            "2",
+            "--list-limit",
+            "20",
             "--source-uri",
             "{source_uri}"
           ],
+          "env": {
+            "PIPELINE_AUDIO_ANALYZER_COMMAND": "{repo}/.venv/bin/python3 ./scripts/analyzer-wrapper.py --input {input} --output {output}",
+            "PIPELINE_ANALYZER_PRIMARY_BACKEND_COMMAND": "{repo}/.venv/bin/python3 ./scripts/beat-this-backend.py --input {input} --output {output}",
+            "PIPELINE_ANALYZER_FALLBACK_BACKEND_COMMAND": "{repo}/.venv/bin/python3 ./scripts/backend-analyzer.py --input {input} --output {output}",
+            "PIPELINE_ANALYZER_FALLBACK_POLICY": "on-error-or-invalid",
+            "PIPELINE_ANALYZER_VALIDATION_MODE": "require-timing",
+            "PIPELINE_AUDIO_ANALYZER_TIMEOUT_SECONDS": "300",
+            "PIPELINE_AUDIO_ANALYZER_STDOUT_JSON": "false"
+          },
           "timeout_seconds": 600
         }
       }

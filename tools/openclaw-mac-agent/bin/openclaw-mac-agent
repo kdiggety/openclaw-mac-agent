@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
+AGENT_REPO_ROOT = BASE_DIR.parents[1]
 DEFAULT_CONFIG = BASE_DIR / "config" / "repos.json"
 DEFAULT_CONFIG_EXAMPLE = BASE_DIR / "config" / "repos.example.json"
 DEFAULT_AGENT_HOME = Path.home() / ".openclaw-mac-agent"
@@ -36,6 +38,7 @@ PUBLIC_VERBS = {
     "get-run-status",
     "git-fetch",
     "git-pull",
+    "git-sync",
 }
 TEXT_EXTENSIONS = {
     ".json",
@@ -228,20 +231,45 @@ def file_is_text(path: Path) -> bool:
     return b"\x00" not in sample
 
 
-def build_env(repo_info: Dict[str, Any], run_dir: Optional[Path] = None) -> Dict[str, str]:
-    repo_path = repo_info["path"]
-    tmp_dir = repo_info["roots"]["tmp"]
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+def runtime_dirs(repo_info: Dict[str, Any], run_dir: Optional[Path] = None) -> Dict[str, Path]:
+    base_dir = run_dir or repo_info["roots"]["tmp"]
+    tmp_dir = base_dir / "tmp" if run_dir else repo_info["roots"]["tmp"]
+    home_dir = base_dir / "home"
+    cache_dir = base_dir / "cache"
+    clang_cache_dir = cache_dir / "clang" / "ModuleCache"
+    swiftpm_cache_dir = home_dir / "Library" / "Caches" / "org.swift.swiftpm"
+    swiftpm_config_dir = home_dir / "Library" / "org.swift.swiftpm" / "configuration"
+    swiftpm_security_dir = home_dir / "Library" / "org.swift.swiftpm" / "security"
+    for path in (tmp_dir, home_dir, cache_dir, clang_cache_dir, swiftpm_cache_dir, swiftpm_config_dir, swiftpm_security_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    return {
+        "base": base_dir,
+        "tmp": tmp_dir,
+        "home": home_dir,
+        "cache": cache_dir,
+        "clang_cache": clang_cache_dir,
+        "swiftpm_cache": swiftpm_cache_dir,
+        "swiftpm_config": swiftpm_config_dir,
+        "swiftpm_security": swiftpm_security_dir,
+    }
+
+
+def build_env(repo_info: Dict[str, Any], run_dir: Optional[Path] = None, extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    dirs = runtime_dirs(repo_info, run_dir)
     env = {
-        "HOME": str(Path.home()),
+        "HOME": str(dirs["home"]),
         "USER": os.environ.get("USER", ""),
         "LOGNAME": os.environ.get("LOGNAME", ""),
         "PATH": PATH_ENV,
-        "TMPDIR": str(tmp_dir),
+        "TMPDIR": str(dirs["tmp"]),
+        "XDG_CACHE_HOME": str(dirs["cache"]),
+        "CLANG_MODULE_CACHE_PATH": str(dirs["clang_cache"]),
         "PYTHONUNBUFFERED": "1",
     }
     if run_dir:
         env["OPENCLAW_RUN_DIR"] = str(run_dir)
+    if extra_env:
+        env.update(extra_env)
     return env
 
 
@@ -266,11 +294,21 @@ def resolve_executable(argv0: str, repo_info: Dict[str, Any]) -> Path:
         Path("/opt/homebrew/bin/ffmpeg"),
         Path("/opt/homebrew/bin/ffprobe"),
     }
+    allowed_prefixes = (
+        Path("/opt/homebrew/Cellar"),
+        Path("/opt/homebrew/bin"),
+    )
     repo_path = repo_info["path"]
     venv_python = (repo_path / ".venv" / "bin" / "python").resolve() if (repo_path / ".venv" / "bin" / "python").exists() else None
 
     if resolved in allowed:
         return resolved
+    for prefix in allowed_prefixes:
+        try:
+            if os.path.commonpath([str(prefix), str(resolved)]) == str(prefix):
+                return resolved
+        except ValueError:
+            pass
     if venv_python and resolved == venv_python:
         return resolved
     try:
@@ -288,11 +326,12 @@ def run_subprocess(
     cwd: Optional[Path] = None,
     timeout: int,
     run_dir: Optional[Path] = None,
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     executable = resolve_executable(argv[0], repo_info)
     argv = [str(executable), *argv[1:]]
     cwd = cwd or repo_info["path"]
-    env = build_env(repo_info, run_dir)
+    env = build_env(repo_info, run_dir, extra_env)
     try:
         completed = subprocess.run(
             argv,
@@ -333,6 +372,35 @@ def repo_status_lines(repo_info: Dict[str, Any]) -> List[str]:
     result = run_subprocess(["git", "status", "--short"], repo_info=repo_info, timeout=10)
     lines = [line for line in result["stdout"].splitlines() if line.strip()]
     return lines[:200]
+
+
+def git_head(repo_info: Dict[str, Any]) -> str:
+    result = run_subprocess(["git", "rev-parse", "HEAD"], repo_info=repo_info, timeout=10)
+    return result["stdout"].strip()
+
+
+def validate_branch_name(branch: str) -> None:
+    if not branch or not re.fullmatch(r"[A-Za-z0-9._/-]+", branch):
+        raise AgentError("INVALID_BRANCH", f"Invalid branch name: {branch}", 22, {"branch": branch})
+    if branch.startswith("/") or branch.endswith("/") or ".." in branch or "@{" in branch or "\\" in branch:
+        raise AgentError("INVALID_BRANCH", f"Invalid branch name: {branch}", 22, {"branch": branch})
+
+
+def validate_commit_sha(commit: str) -> None:
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit):
+        raise AgentError("INVALID_COMMIT", f"Invalid commit SHA: {commit}", 22, {"expected_commit": commit})
+
+
+def parse_summary_artifacts(run_dir: Path) -> List[Dict[str, Any]]:
+    summary_path = run_dir / "artifacts" / "summary.json"
+    if not summary_path.exists():
+        return []
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    items = payload.get("artifacts")
+    return items if isinstance(items, list) else []
 
 
 def handler_env_check(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
@@ -551,10 +619,29 @@ def ensure_file_uri(source_uri: str) -> Path:
 
 
 def render_template_list(items: List[str], repo_info: Dict[str, Any], extra: Optional[Dict[str, str]] = None) -> List[str]:
-    mapping = {"repo": str(repo_info["path"])}
+    mapping = {
+        "repo": str(repo_info["path"]),
+        "agent_base": str(BASE_DIR),
+        "agent_repo": str(AGENT_REPO_ROOT),
+        "input": "{input}",
+        "output": "{output}",
+    }
     mapping.update({f"root_{name}": str(path) for name, path in repo_info["roots"].items()})
     mapping.update(extra or {})
     return [item.format(**mapping) for item in items]
+
+
+def render_template_map(items: Dict[str, str], repo_info: Dict[str, Any], extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    mapping = {
+        "repo": str(repo_info["path"]),
+        "agent_base": str(BASE_DIR),
+        "agent_repo": str(AGENT_REPO_ROOT),
+        "input": "{input}",
+        "output": "{output}",
+    }
+    mapping.update({f"root_{name}": str(path) for name, path in repo_info["roots"].items()})
+    mapping.update(extra or {})
+    return {key: value.format(**mapping) for key, value in items.items()}
 
 
 def handler_validate_analyzer(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
@@ -577,9 +664,11 @@ def handler_validate_analyzer(args: argparse.Namespace, config: Dict[str, Any], 
 
     recipe = (repo_cfg.get("recipes") or {}).get("validate-analyzer")
     if recipe:
-        argv = render_template_list(recipe["argv"], repo_info, {"source_uri": args.source_uri or "", "source_path": str(source_path or "")})
+        template_vars = {"source_uri": args.source_uri or "", "source_path": str(source_path or "")}
+        argv = render_template_list(recipe["argv"], repo_info, template_vars)
+        recipe_env = render_template_map(recipe.get("env") or {}, repo_info, template_vars)
         timeout = int(recipe.get("timeout_seconds", 60))
-        result = run_subprocess(argv, repo_info=repo_info, timeout=timeout)
+        result = run_subprocess(argv, repo_info=repo_info, timeout=timeout, extra_env=recipe_env)
         validation["imports_ok"] = result["status"] == 0
         logs.append({"stdout": result["stdout"], "stderr": result["stderr"]})
         if result["status"] != 0:
@@ -618,9 +707,11 @@ def handler_run_pipeline(args: argparse.Namespace, config: Dict[str, Any], repo_
     stdout_log = run_dir / "stdout.log"
     stderr_log = run_dir / "stderr.log"
     recipe = profiles[args.profile]
-    argv = render_template_list(recipe["argv"], repo_info, {"source_uri": args.source_uri, "source_path": str(source_path), "run_dir": str(run_dir)})
+    template_vars = {"source_uri": args.source_uri, "source_path": str(source_path), "run_dir": str(run_dir)}
+    argv = render_template_list(recipe["argv"], repo_info, template_vars)
+    recipe_env = render_template_map(recipe.get("env") or {}, repo_info, template_vars)
     timeout = int(recipe.get("timeout_seconds", 600))
-    child_env = build_env(repo_info, run_dir)
+    child_env = build_env(repo_info, run_dir, recipe_env)
     child_env["OPENCLAW_MAC_AGENT_CONFIG"] = str(config["_config_path"])
 
     status_payload = {
@@ -694,7 +785,9 @@ def internal_run_profile(args: argparse.Namespace) -> int:
     profiles = (repo_info["config"].get("pipeline_profiles") or {})
     recipe = profiles[args.profile]
     run_dir = repo_info["roots"]["runs"] / args.run_id
-    argv = render_template_list(recipe["argv"], repo_info, {"source_uri": args.source_uri, "source_path": str(ensure_file_uri(args.source_uri)), "run_dir": str(run_dir)})
+    template_vars = {"source_uri": args.source_uri, "source_path": str(ensure_file_uri(args.source_uri)), "run_dir": str(run_dir)}
+    argv = render_template_list(recipe["argv"], repo_info, template_vars)
+    recipe_env = render_template_map(recipe.get("env") or {}, repo_info, template_vars)
     timeout = int(recipe.get("timeout_seconds", 600))
     start_time = time.time()
 
@@ -704,7 +797,7 @@ def internal_run_profile(args: argparse.Namespace) -> int:
         process = subprocess.run(
             argv,
             cwd=str(repo_info["path"]),
-            env=build_env(repo_info, run_dir),
+            env=build_env(repo_info, run_dir, recipe_env),
             timeout=timeout,
             check=False,
         )
@@ -713,6 +806,7 @@ def internal_run_profile(args: argparse.Namespace) -> int:
         status_payload["finished_at"] = utc_now()
         status_payload["duration_ms"] = int((time.time() - start_time) * 1000)
         status_payload["exit_code"] = process.returncode
+        status_payload["artifacts"] = parse_summary_artifacts(run_dir)
         write_status_file(run_dir, status_payload)
         return process.returncode
     except AgentError as exc:
@@ -722,6 +816,7 @@ def internal_run_profile(args: argparse.Namespace) -> int:
         status_payload["duration_ms"] = int((time.time() - start_time) * 1000)
         status_payload["exit_code"] = exc.exit_code
         status_payload["error"] = {"code": exc.code, "message": exc.message, "details": exc.details}
+        status_payload["artifacts"] = parse_summary_artifacts(run_dir)
         write_status_file(run_dir, status_payload)
         return exc.exit_code
 
@@ -763,6 +858,48 @@ def handler_git_pull(args: argparse.Namespace, config: Dict[str, Any], repo_info
     }
 
 
+def handler_git_sync(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    validate_branch_name(args.branch)
+    validate_commit_sha(args.expected_commit)
+    ensure_clean_tree(repo_info)
+
+    fetch_result = run_subprocess(["git", "fetch", "--prune", "origin"], repo_info=repo_info, timeout=60)
+    remote_ref = f"refs/remotes/origin/{args.branch}"
+    ref_check = run_subprocess(["git", "show-ref", "--verify", remote_ref], repo_info=repo_info, timeout=10)
+    if ref_check["status"] != 0:
+        raise AgentError("REMOTE_BRANCH_NOT_FOUND", f"Remote branch not found: origin/{args.branch}", 22, {"branch": args.branch})
+
+    commit_check = run_subprocess(["git", "rev-parse", "--verify", f"{args.expected_commit}^{{commit}}"], repo_info=repo_info, timeout=10)
+    if commit_check["status"] != 0:
+        raise AgentError("COMMIT_NOT_FOUND", f"Commit not found: {args.expected_commit}", 22, {"expected_commit": args.expected_commit})
+    resolved_commit = commit_check["stdout"].strip()
+
+    ancestry = run_subprocess(["git", "merge-base", "--is-ancestor", resolved_commit, remote_ref], repo_info=repo_info, timeout=10)
+    if ancestry["status"] != 0:
+        raise AgentError(
+            "COMMIT_NOT_ON_BRANCH",
+            f"Commit {resolved_commit} is not reachable from origin/{args.branch}",
+            22,
+            {"branch": args.branch, "expected_commit": resolved_commit},
+        )
+
+    checkout = run_subprocess(["git", "checkout", "--detach", resolved_commit], repo_info=repo_info, timeout=30)
+    final_head = git_head(repo_info)
+    return {
+        "repo": repo_info["name"],
+        "git": {
+            "operation": "sync",
+            "branch": args.branch,
+            "expected_commit": args.expected_commit,
+            "resolved_commit": resolved_commit,
+            "head": final_head,
+            "exit_code": checkout["status"],
+        },
+        "stdout": "\n".join(part for part in [fetch_result["stdout"], checkout["stdout"]] if part).strip(),
+        "stderr": "\n".join(part for part in [fetch_result["stderr"], checkout["stderr"]] if part).strip(),
+    }
+
+
 HANDLERS = {
     "env-check": handler_env_check,
     "repo-status": handler_repo_status,
@@ -775,6 +912,7 @@ HANDLERS = {
     "get-run-status": handler_get_run_status,
     "git-fetch": handler_git_fetch,
     "git-pull": handler_git_pull,
+    "git-sync": handler_git_sync,
 }
 
 
@@ -841,6 +979,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser_pull.add_argument("--repo", required=True)
     parser_pull.add_argument("--ff-only", action="store_true", required=False)
     parser_pull.add_argument("--json", action="store_true")
+
+    parser_sync = subparsers.add_parser("git-sync")
+    parser_sync.add_argument("--repo", required=True)
+    parser_sync.add_argument("--branch", required=True)
+    parser_sync.add_argument("--expected-commit", required=True)
+    parser_sync.add_argument("--json", action="store_true")
 
     internal = subparsers.add_parser("__run-profile")
     internal.add_argument("--repo", required=True)
