@@ -758,6 +758,13 @@ def handler_resolve_sources(args: argparse.Namespace, config: Dict[str, Any], re
 def handler_validate_analyzer(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
     venv_python = repo_info["path"] / ".venv" / "bin" / "python"
     repo_cfg = repo_info["config"]
+    profile = None
+    if getattr(args, "profile", None):
+        profiles = (repo_cfg.get("pipeline_profiles") or {})
+        if args.profile not in profiles:
+            raise AgentError("UNKNOWN_PROFILE", f"Unknown pipeline profile: {args.profile}", 22, {"profile": args.profile})
+        profile = dict(profiles[args.profile])
+        profile["name"] = args.profile
     logs = []
     source_uri_checked = False
     source_path = None
@@ -778,6 +785,7 @@ def handler_validate_analyzer(args: argparse.Namespace, config: Dict[str, Any], 
             source_uri=args.source_uri,
             source_name=getattr(args, "source_name", None),
             sample_set=getattr(args, "sample_set", None),
+            profile=profile,
         )
         source_uri_checked = True
         validation["source_uri_checked"] = True
@@ -803,6 +811,7 @@ def handler_validate_analyzer(args: argparse.Namespace, config: Dict[str, Any], 
         "source": {
             "source_uri": resolved_source_uri or args.source_uri,
             "source_name": resolved_source_name or getattr(args, "source_name", None),
+            "profile": getattr(args, "profile", None),
         },
         "logs": logs,
     }
@@ -1110,6 +1119,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser_validate = subparsers.add_parser("validate-analyzer")
     parser_validate.add_argument("--repo", required=True)
+    parser_validate.add_argument("--profile")
     parser_validate.add_argument("--source-uri")
     parser_validate.add_argument("--source-name")
     parser_validate.add_argument("--sample-set")

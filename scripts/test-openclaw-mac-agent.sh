@@ -170,8 +170,9 @@ VAL_JSON="$(run_json validate-analyzer --repo masterofdrums-pipeline --source-ur
 [[ "$(json_field "$VAL_JSON" "ok")" == "True" || "$(json_field "$VAL_JSON" "ok")" == "true" ]]
 
 printf 'Phase 7b: validate-analyzer default sample\n'
-VAL_DEFAULT_JSON="$(run_json validate-analyzer --repo masterofdrums-pipeline --source-name fixture-input --json)"
+VAL_DEFAULT_JSON="$(run_json validate-analyzer --repo masterofdrums-pipeline --profile debug --json)"
 [[ "$(json_field "$VAL_DEFAULT_JSON" "ok")" == "True" || "$(json_field "$VAL_DEFAULT_JSON" "ok")" == "true" ]]
+[[ "$(json_field "$VAL_DEFAULT_JSON" "data.source.source_name")" == "fixture-input" ]]
 
 printf 'Phase 8: run-pipeline + get-run-status\n'
 RUN_JSON="$(run_json run-pipeline --repo masterofdrums-pipeline --source-uri "file://${INPUT_FILE}" --profile debug --json)"
