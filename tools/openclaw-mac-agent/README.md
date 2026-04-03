@@ -141,3 +141,22 @@ to exercise the real forced-command path with:
 - `repo-status`
 - `tail-file`
 - `list-artifacts`
+
+## OpenClaw Wrapper
+
+For the actual OpenClaw-driven validation flow, use:
+
+```bash
+TARGET_BRANCH=main \
+EXPECTED_COMMIT=<sha> \
+SOURCE_URI='file:///absolute/path/to/audio.mp3' \
+MAC_SSH_KEY=~/.ssh/openclaw_mac_agent \
+bash ./scripts/run-openclaw-masterofdrums-validation.sh
+```
+
+This wrapper belongs in the agent repo rather than the pipeline repo because it owns:
+
+- SSH transport details
+- branch/commit sync semantics
+- polling and result collation
+- the final machine-readable validation payload

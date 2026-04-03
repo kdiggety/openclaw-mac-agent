@@ -214,6 +214,12 @@ The wrapper reports `jobId` values and remote artifact paths in JSON. Direct `rs
 
 For broader repo inspection and bounded pipeline debugging over SSH, use `openclaw-mac-agent` with its own forced-command wrapper instead of overloading `mac_worker`.
 
+The Linux/OpenClaw-side operational wrapper for the broader agent lives in this repo, not in `masterofdrums-pipeline`:
+
+- [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/scripts/run-openclaw-masterofdrums-validation.sh`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/scripts/run-openclaw-masterofdrums-validation.sh)
+
+Keep it here because it is orchestration and SSH contract glue, not application logic. The pipeline repo should stay focused on the app and its native CLI.
+
 For `masterofdrums-pipeline`, the new `openclaw-mac-agent` flow now integrates with the real app CLI:
 
 - analyzer validation routes through `swift run MasterOfDrumsPipeline validate-audio-analyzer`
@@ -224,6 +230,25 @@ For a simple Linux-side smoke test of that path, use:
 ```bash
 bash ./scripts/test-openclaw-mac-agent-remote.sh
 ```
+
+For the actual OpenClaw-driven validation flow, use:
+
+```bash
+TARGET_BRANCH=main \
+EXPECTED_COMMIT=<sha> \
+SOURCE_URI='file:///absolute/path/to/audio.mp3' \
+MAC_SSH_KEY=~/.ssh/openclaw_mac_agent \
+bash ./scripts/run-openclaw-masterofdrums-validation.sh
+```
+
+That wrapper:
+
+- syncs the Mac repo to an exact branch and commit with `git-sync`
+- runs `env-check`
+- optionally runs `validate-analyzer`
+- runs the bounded debug pipeline profile
+- polls `get-run-status`
+- returns one final JSON document including the chart artifact URI when available
 
 There is also a checked-in example env file for the Linux side:
 
