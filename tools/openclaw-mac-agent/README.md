@@ -113,6 +113,7 @@ bash ./scripts/test-openclaw-mac-agent-remote.sh
 ```
 
 Update `MAC_AGENT_LOG_ROOT` and `MAC_AGENT_LOG_PATH` in that env file to match a real log file in the target repo.
+Those overrides are optional. If unset, the script will auto-discover a readable file from `logs/`, `runs/`, or `output/`.
 
 to exercise the real forced-command path with:
 

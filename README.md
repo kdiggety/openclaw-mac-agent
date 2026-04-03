@@ -227,6 +227,7 @@ scripts/test-openclaw-mac-agent-remote.env.example
 ```
 
 Load it before running the remote smoke script if you want stable local defaults for the SSH key, repo name, and log path.
+The log path overrides are optional because the remote smoke script now auto-discovers a readable file from the safe roots when possible.
 
 For Mac-side setup of the `openclaw-mac-agent` config and SSH wrapper path, use:
 
