@@ -29,6 +29,7 @@ MAX_LIST_ITEMS = 500
 PUBLIC_VERBS = {
     "env-check",
     "repo-status",
+    "resolve-sources",
     "read-file",
     "tail-file",
     "list-artifacts",
@@ -618,6 +619,94 @@ def ensure_file_uri(source_uri: str) -> Path:
     return path.resolve()
 
 
+def resolve_source_entries(
+    repo_info: Dict[str, Any],
+    *,
+    source_uri: Optional[str],
+    source_name: Optional[str],
+    sample_set: Optional[str],
+    profile: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    repo_cfg = repo_info["config"]
+    sample_sources = repo_cfg.get("sample_sources") or {}
+    sample_sets = repo_cfg.get("sample_sets") or {}
+
+    if sum(1 for value in (source_uri, source_name, sample_set) if value) > 1:
+        raise AgentError("SOURCE_SELECTOR_CONFLICT", "Set only one of source-uri, source-name, or sample-set", 22)
+
+    def direct_source(uri: str) -> Dict[str, Any]:
+        return {"source_name": None, "source_uri": uri, "source_path": str(ensure_file_uri(uri))}
+
+    def named_source(name: str) -> Dict[str, Any]:
+        if name not in sample_sources:
+            raise AgentError("UNKNOWN_SAMPLE_SOURCE", f"Unknown sample source: {name}", 22, {"source_name": name})
+        uri = sample_sources[name]
+        return {"source_name": name, "source_uri": uri, "source_path": str(ensure_file_uri(uri))}
+
+    def named_set(name: str) -> List[Dict[str, Any]]:
+        if name not in sample_sets:
+            raise AgentError("UNKNOWN_SAMPLE_SET", f"Unknown sample set: {name}", 22, {"sample_set": name})
+        entries = sample_sets[name]
+        if not isinstance(entries, list) or not entries:
+            raise AgentError("EMPTY_SAMPLE_SET", f"Sample set is empty: {name}", 22, {"sample_set": name})
+        resolved: List[Dict[str, Any]] = []
+        for item in entries:
+            if not isinstance(item, str):
+                raise AgentError("INVALID_SAMPLE_SET", f"Sample set entries must be strings: {name}", 22, {"sample_set": name})
+            resolved.append(direct_source(item) if item.startswith("file://") else named_source(item))
+        return resolved
+
+    if source_uri:
+        return [direct_source(source_uri)]
+    if source_name:
+        return [named_source(source_name)]
+    if sample_set:
+        return named_set(sample_set)
+    if profile:
+        default_sample_set = profile.get("default_sample_set")
+        if default_sample_set:
+            return named_set(default_sample_set)
+        default_source_uri = profile.get("default_source_uri")
+        if default_source_uri:
+            return [direct_source(default_source_uri)]
+        default_source_name = profile.get("default_source_name")
+        if default_source_name:
+            return [named_source(default_source_name)]
+
+    raise AgentError(
+        "SOURCE_REQUIRED",
+        "A source is required; pass --source-uri, --source-name, or --sample-set, or configure a default source in the profile",
+        22,
+        {"profile": profile.get("name") if profile else None},
+    )
+
+
+def resolve_source_input(
+    repo_info: Dict[str, Any],
+    *,
+    source_uri: Optional[str],
+    source_name: Optional[str],
+    sample_set: Optional[str],
+    profile: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Path, str]:
+    entries = resolve_source_entries(
+        repo_info,
+        source_uri=source_uri,
+        source_name=source_name,
+        sample_set=sample_set,
+        profile=profile,
+    )
+    if len(entries) != 1:
+        raise AgentError(
+            "MULTI_SOURCE_REQUIRES_BATCH",
+            "Multiple sources resolved; use resolve-sources and run the batch from the wrapper",
+            22,
+            {"count": len(entries)},
+        )
+    entry = entries[0]
+    return entry["source_uri"], Path(entry["source_path"]), entry.get("source_name") or ""
+
+
 def render_template_list(items: List[str], repo_info: Dict[str, Any], extra: Optional[Dict[str, str]] = None) -> List[str]:
     mapping = {
         "repo": str(repo_info["path"]),
@@ -644,16 +733,36 @@ def render_template_map(items: Dict[str, str], repo_info: Dict[str, Any], extra:
     return {key: value.format(**mapping) for key, value in items.items()}
 
 
-def handler_validate_analyzer(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
-    source_uri_checked = False
-    source_path = None
-    if args.source_uri:
-        source_path = ensure_file_uri(args.source_uri)
-        source_uri_checked = True
+def handler_resolve_sources(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    profile = None
+    if getattr(args, "profile", None):
+        profiles = (repo_info["config"].get("pipeline_profiles") or {})
+        if args.profile not in profiles:
+            raise AgentError("UNKNOWN_PROFILE", f"Unknown pipeline profile: {args.profile}", 22, {"profile": args.profile})
+        profile = dict(profiles[args.profile])
+        profile["name"] = args.profile
+    sources = resolve_source_entries(
+        repo_info,
+        source_uri=getattr(args, "source_uri", None),
+        source_name=getattr(args, "source_name", None),
+        sample_set=getattr(args, "sample_set", None),
+        profile=profile,
+    )
+    return {
+        "repo": repo_info["name"],
+        "profile": getattr(args, "profile", None),
+        "sources": sources,
+    }
 
+
+def handler_validate_analyzer(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
     venv_python = repo_info["path"] / ".venv" / "bin" / "python"
     repo_cfg = repo_info["config"]
     logs = []
+    source_uri_checked = False
+    source_path = None
+    resolved_source_uri = ""
+    resolved_source_name = ""
     validation = {
         "venv_present": venv_python.exists(),
         "imports_ok": False,
@@ -664,7 +773,19 @@ def handler_validate_analyzer(args: argparse.Namespace, config: Dict[str, Any], 
 
     recipe = (repo_cfg.get("recipes") or {}).get("validate-analyzer")
     if recipe:
-        template_vars = {"source_uri": args.source_uri or "", "source_path": str(source_path or "")}
+        resolved_source_uri, source_path, resolved_source_name = resolve_source_input(
+            repo_info,
+            source_uri=args.source_uri,
+            source_name=getattr(args, "source_name", None),
+            sample_set=getattr(args, "sample_set", None),
+        )
+        source_uri_checked = True
+        validation["source_uri_checked"] = True
+        template_vars = {
+            "source_uri": resolved_source_uri,
+            "source_path": str(source_path),
+            "source_name": resolved_source_name,
+        }
         argv = render_template_list(recipe["argv"], repo_info, template_vars)
         recipe_env = render_template_map(recipe.get("env") or {}, repo_info, template_vars)
         timeout = int(recipe.get("timeout_seconds", 60))
@@ -676,7 +797,15 @@ def handler_validate_analyzer(args: argparse.Namespace, config: Dict[str, Any], 
     else:
         validation["imports_ok"] = venv_python.exists() or shutil.which("python3", path=PATH_ENV) is not None
 
-    return {"repo": repo_info["name"], "validation": validation, "logs": logs}
+    return {
+        "repo": repo_info["name"],
+        "validation": validation,
+        "source": {
+            "source_uri": resolved_source_uri or args.source_uri,
+            "source_name": resolved_source_name or getattr(args, "source_name", None),
+        },
+        "logs": logs,
+    }
 
 
 def run_dir_status_path(run_dir: Path) -> Path:
@@ -696,18 +825,31 @@ def write_status_file(run_dir: Path, payload: Dict[str, Any]) -> None:
 
 
 def handler_run_pipeline(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
-    source_path = ensure_file_uri(args.source_uri)
     profiles = (repo_info["config"].get("pipeline_profiles") or {})
     if args.profile not in profiles:
         raise AgentError("UNKNOWN_PROFILE", f"Unknown pipeline profile: {args.profile}", 22, {"profile": args.profile})
+    recipe = profiles[args.profile]
+    recipe = dict(recipe)
+    recipe["name"] = args.profile
+    resolved_source_uri, source_path, resolved_source_name = resolve_source_input(
+        repo_info,
+        source_uri=args.source_uri,
+        source_name=getattr(args, "source_name", None),
+        sample_set=getattr(args, "sample_set", None),
+        profile=recipe,
+    )
 
     run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     run_dir = repo_info["roots"]["runs"] / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     stdout_log = run_dir / "stdout.log"
     stderr_log = run_dir / "stderr.log"
-    recipe = profiles[args.profile]
-    template_vars = {"source_uri": args.source_uri, "source_path": str(source_path), "run_dir": str(run_dir)}
+    template_vars = {
+        "source_uri": resolved_source_uri,
+        "source_path": str(source_path),
+        "source_name": resolved_source_name,
+        "run_dir": str(run_dir),
+    }
     argv = render_template_list(recipe["argv"], repo_info, template_vars)
     recipe_env = render_template_map(recipe.get("env") or {}, repo_info, template_vars)
     timeout = int(recipe.get("timeout_seconds", 600))
@@ -718,7 +860,8 @@ def handler_run_pipeline(args: argparse.Namespace, config: Dict[str, Any], repo_
         "run_id": run_id,
         "repo": repo_info["name"],
         "profile": args.profile,
-        "source_uri": args.source_uri,
+        "source_uri": resolved_source_uri,
+        "source_name": resolved_source_name or None,
         "status": "running",
         "started_at": utc_now(),
         "finished_at": None,
@@ -744,7 +887,7 @@ def handler_run_pipeline(args: argparse.Namespace, config: Dict[str, Any], repo_
         "--profile",
         args.profile,
         "--source-uri",
-        args.source_uri,
+        resolved_source_uri,
     ]
     with stdout_log.open("a", encoding="utf-8") as stdout_handle, stderr_log.open("a", encoding="utf-8") as stderr_handle:
         process = subprocess.Popen(
@@ -763,7 +906,8 @@ def handler_run_pipeline(args: argparse.Namespace, config: Dict[str, Any], repo_
         "run": {
             "run_id": run_id,
             "profile": args.profile,
-            "source_uri": args.source_uri,
+            "source_uri": resolved_source_uri,
+            "source_name": resolved_source_name or None,
             "started_at": status_payload["started_at"],
             "finished_at": None,
             "duration_ms": None,
@@ -903,6 +1047,7 @@ def handler_git_sync(args: argparse.Namespace, config: Dict[str, Any], repo_info
 HANDLERS = {
     "env-check": handler_env_check,
     "repo-status": handler_repo_status,
+    "resolve-sources": handler_resolve_sources,
     "read-file": handler_read_file,
     "tail-file": handler_tail_file,
     "list-artifacts": handler_list_artifacts,
@@ -928,6 +1073,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser_status = subparsers.add_parser("repo-status")
     parser_status.add_argument("--repo", required=True)
     parser_status.add_argument("--json", action="store_true")
+
+    parser_sources = subparsers.add_parser("resolve-sources")
+    parser_sources.add_argument("--repo", required=True)
+    parser_sources.add_argument("--profile")
+    parser_sources.add_argument("--source-uri")
+    parser_sources.add_argument("--source-name")
+    parser_sources.add_argument("--sample-set")
+    parser_sources.add_argument("--json", action="store_true")
 
     parser_read = subparsers.add_parser("read-file")
     parser_read.add_argument("--repo", required=True)
@@ -958,11 +1111,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser_validate = subparsers.add_parser("validate-analyzer")
     parser_validate.add_argument("--repo", required=True)
     parser_validate.add_argument("--source-uri")
+    parser_validate.add_argument("--source-name")
+    parser_validate.add_argument("--sample-set")
     parser_validate.add_argument("--json", action="store_true")
 
     parser_run = subparsers.add_parser("run-pipeline")
     parser_run.add_argument("--repo", required=True)
-    parser_run.add_argument("--source-uri", required=True)
+    parser_run.add_argument("--source-uri")
+    parser_run.add_argument("--source-name")
+    parser_run.add_argument("--sample-set")
     parser_run.add_argument("--profile", required=True)
     parser_run.add_argument("--json", action="store_true")
 

@@ -43,6 +43,14 @@ cat > "${CONFIG_PATH}" <<EOF
   "repos": {
     "masterofdrums-pipeline": {
       "path": "${APP_REPO_PATH}",
+      "sample_sources": {
+        "known-tone": "file:///Users/${WORKER_USER}/workspace/masterofdrums-pipeline/Tests/PipelineRuntimeTests/Fixtures/known-tone.wav"
+      },
+      "sample_sets": {
+        "smoke": [
+          "known-tone"
+        ]
+      },
       "roots": {
         "logs": "{repo}/logs",
         "artifacts": "{repo}/output",
@@ -82,6 +90,7 @@ cat > "${CONFIG_PATH}" <<EOF
       },
       "pipeline_profiles": {
         "debug": {
+          "default_sample_set": "smoke",
           "argv": [
             "/usr/bin/python3",
             "{agent_repo}/scripts/run-masterofdrums-pipeline-debug.py",

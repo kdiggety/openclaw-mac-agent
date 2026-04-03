@@ -2,6 +2,14 @@
   "repos": {
     "masterofdrums-pipeline": {
       "path": "/Users/openclaw-agent/workspace/masterofdrums-pipeline",
+      "sample_sources": {
+        "known-tone": "file:///Users/openclaw-agent/workspace/masterofdrums-pipeline/Tests/PipelineRuntimeTests/Fixtures/known-tone.wav"
+      },
+      "sample_sets": {
+        "smoke": [
+          "known-tone"
+        ]
+      },
       "roots": {
         "logs": "{repo}/logs",
         "artifacts": "{repo}/output",
@@ -41,6 +49,7 @@
       },
       "pipeline_profiles": {
         "debug": {
+          "default_sample_set": "smoke",
           "argv": [
             "/usr/bin/python3",
             "{agent_repo}/scripts/run-masterofdrums-pipeline-debug.py",

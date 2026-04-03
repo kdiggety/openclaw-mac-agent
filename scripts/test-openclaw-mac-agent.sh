@@ -17,6 +17,7 @@ mkdir -p "${FAKE_REPO}/logs" "${FAKE_REPO}/output/latest" "${FAKE_REPO}/tmp" "${
 printf 'line1\nline2\nline3\n' > "${FAKE_REPO}/logs/pipeline.log"
 printf '{"meta":{"name":"demo"},"events":[1,2,3],"tempo_map":[120]}\n' > "${FAKE_REPO}/output/latest/base-chart.json"
 printf 'hello world\n' > "${FAKE_REPO}/README.txt"
+printf 'fake' > "${FAKE_REPO}/tmp/input.wav"
 
 cat > "${FAKE_REPO}/scripts/validate_analyzer.py" <<'EOF'
 #!/usr/bin/env python3
@@ -64,8 +65,17 @@ cat > "${FAKE_CONFIG}" <<EOF
   "repos": {
     "masterofdrums-pipeline": {
       "path": "${FAKE_REPO}",
+      "sample_sources": {
+        "fixture-input": "file://${FAKE_REPO}/tmp/input.wav"
+      },
+      "sample_sets": {
+        "smoke": [
+          "fixture-input"
+        ]
+      },
       "pipeline_profiles": {
         "debug": {
+          "default_sample_set": "smoke",
           "argv": [
             "/usr/bin/python3",
             "{repo}/scripts/run_pipeline.py",
@@ -103,7 +113,10 @@ import sys
 
 value = json.loads(os.environ["TEST_JSON"])
 for part in sys.argv[1].split("."):
-    value = value[part]
+    if isinstance(value, list):
+        value = value[int(part)]
+    else:
+        value = value[part]
 print(value)
 PY
 }
@@ -146,11 +159,19 @@ printf 'Phase 6: summarize-artifact\n'
 SUM_JSON="$(run_json summarize-artifact --repo masterofdrums-pipeline --root artifacts --path latest/base-chart.json --json)"
 [[ "$(json_field "$SUM_JSON" "data.artifact.kind")" == "json" ]]
 
+printf 'Phase 6b: resolve-sources sample set\n'
+RESOLVE_JSON="$(run_json resolve-sources --repo masterofdrums-pipeline --profile debug --sample-set smoke --json)"
+[[ "$(json_field "$RESOLVE_JSON" "ok")" == "True" || "$(json_field "$RESOLVE_JSON" "ok")" == "true" ]]
+[[ "$(json_field "$RESOLVE_JSON" "data.sources.0.source_name")" == "fixture-input" ]]
+
 printf 'Phase 7: validate-analyzer\n'
 INPUT_FILE="${FAKE_REPO}/tmp/input.wav"
-printf 'fake' > "${INPUT_FILE}"
 VAL_JSON="$(run_json validate-analyzer --repo masterofdrums-pipeline --source-uri "file://${INPUT_FILE}" --json)"
 [[ "$(json_field "$VAL_JSON" "ok")" == "True" || "$(json_field "$VAL_JSON" "ok")" == "true" ]]
+
+printf 'Phase 7b: validate-analyzer default sample\n'
+VAL_DEFAULT_JSON="$(run_json validate-analyzer --repo masterofdrums-pipeline --source-name fixture-input --json)"
+[[ "$(json_field "$VAL_DEFAULT_JSON" "ok")" == "True" || "$(json_field "$VAL_DEFAULT_JSON" "ok")" == "true" ]]
 
 printf 'Phase 8: run-pipeline + get-run-status\n'
 RUN_JSON="$(run_json run-pipeline --repo masterofdrums-pipeline --source-uri "file://${INPUT_FILE}" --profile debug --json)"
@@ -158,6 +179,13 @@ RUN_ID="$(json_field "$RUN_JSON" "data.run.run_id")"
 sleep 1
 RUN_STATUS_JSON="$(run_json get-run-status --repo masterofdrums-pipeline --run-id "${RUN_ID}" --json)"
 [[ "$(json_field "$RUN_STATUS_JSON" "data.run.status")" == "completed" ]]
+
+printf 'Phase 8b: run-pipeline default sample\n'
+RUN_DEFAULT_JSON="$(run_json run-pipeline --repo masterofdrums-pipeline --profile debug --json)"
+RUN_DEFAULT_ID="$(json_field "$RUN_DEFAULT_JSON" "data.run.run_id")"
+sleep 1
+RUN_DEFAULT_STATUS_JSON="$(run_json get-run-status --repo masterofdrums-pipeline --run-id "${RUN_DEFAULT_ID}" --json)"
+[[ "$(json_field "$RUN_DEFAULT_STATUS_JSON" "data.run.status")" == "completed" ]]
 
 printf 'Phase 9: git-fetch\n'
 FETCH_JSON="$(run_json git-fetch --repo masterofdrums-pipeline --json)"

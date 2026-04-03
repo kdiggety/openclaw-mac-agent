@@ -236,9 +236,14 @@ For the actual OpenClaw-driven validation flow, use:
 ```bash
 TARGET_BRANCH=main \
 EXPECTED_COMMIT=<sha> \
-SOURCE_URI='file:///absolute/path/to/audio.mp3' \
 MAC_SSH_KEY=~/.ssh/openclaw_mac_agent \
 bash ./scripts/run-openclaw-masterofdrums-validation.sh
+```
+
+If you want OpenClaw to select among Mac-defined fixtures without passing file paths, it can optionally add:
+
+```bash
+SAMPLE_SET=smoke
 ```
 
 That wrapper:
@@ -249,6 +254,8 @@ That wrapper:
 - runs the bounded debug pipeline profile
 - polls `get-run-status`
 - returns one final JSON document including the chart artifact URI when available
+
+By default, the Mac-side profile can now own the sample input via `default_sample_set`, `default_source_name`, or `default_source_uri` in `repos.json`. Linux/OpenClaw does not need to know any Mac file paths, and only needs to pass `SOURCE_URI`, `SOURCE_NAME`, or `SAMPLE_SET` when overriding that default. `SAMPLE_SET` is optional and is just a logical Mac-side name.
 
 There is also a checked-in example env file for the Linux side:
 

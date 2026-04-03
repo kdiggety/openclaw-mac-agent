@@ -59,6 +59,8 @@ The checked-in `masterofdrums-pipeline` example now targets the real app flow:
   - `list-jobs`
   - `list-events`
   - `list-artifacts`
+- sample inputs can be declared in config via `sample_sources` and grouped into `sample_sets`, with a profile-level `default_sample_set`, `default_source_name`, or `default_source_uri`
+- Linux can optionally request a logical `sample_set`, but the Mac-side config owns the actual file paths
 
 To generate a real `repos.json` for the dedicated Mac worker account, use:
 
@@ -149,7 +151,6 @@ For the actual OpenClaw-driven validation flow, use:
 ```bash
 TARGET_BRANCH=main \
 EXPECTED_COMMIT=<sha> \
-SOURCE_URI='file:///absolute/path/to/audio.mp3' \
 MAC_SSH_KEY=~/.ssh/openclaw_mac_agent \
 bash ./scripts/run-openclaw-masterofdrums-validation.sh
 ```
@@ -160,3 +161,5 @@ This wrapper belongs in the agent repo rather than the pipeline repo because it 
 - branch/commit sync semantics
 - polling and result collation
 - the final machine-readable validation payload
+
+If `SOURCE_URI` and `SOURCE_NAME` are omitted, the wrapper now relies on the Mac-side profile default configured in `repos.json`.

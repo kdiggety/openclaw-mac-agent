@@ -17,13 +17,15 @@ openclaw-mac-agent SSH surface:
 Required environment:
   TARGET_BRANCH              branch OpenClaw wants tested
   EXPECTED_COMMIT            exact commit SHA OpenClaw wants tested
-  SOURCE_URI                 file:// URI for the audio input
 
 Optional environment:
   MAC_HOST                   default: openclaw-agent@192.168.1.156
   MAC_SSH_KEY                default: ~/.ssh/openclaw_mac_agent
   MAC_AGENT_REPO             default: masterofdrums-pipeline
   PIPELINE_PROFILE           default: debug
+  SOURCE_URI                 explicit file:// URI for the audio input on the Mac
+  SOURCE_NAME                logical Mac-side sample source name from repos.json
+  SAMPLE_SET                 logical Mac-side sample set name from repos.json
   RUN_VALIDATE_ANALYZER      default: 1
   POLL_INTERVAL_SECONDS      default: 5
   POLL_TIMEOUT_SECONDS       default: 900
@@ -55,6 +57,8 @@ POLL_TIMEOUT_SECONDS="${POLL_TIMEOUT_SECONDS:-900}"
 TARGET_BRANCH="${TARGET_BRANCH:-}"
 EXPECTED_COMMIT="${EXPECTED_COMMIT:-}"
 SOURCE_URI="${SOURCE_URI:-}"
+SOURCE_NAME="${SOURCE_NAME:-}"
+SAMPLE_SET="${SAMPLE_SET:-}"
 
 [[ -f "$MAC_SSH_KEY" ]] || {
   printf 'missing SSH private key: %s\n' "$MAC_SSH_KEY" >&2
@@ -71,10 +75,14 @@ SOURCE_URI="${SOURCE_URI:-}"
   exit 7
 }
 
-[[ -n "$SOURCE_URI" ]] || {
-  printf 'missing required SOURCE_URI\n' >&2
+SELECTOR_COUNT=0
+[[ -n "$SOURCE_URI" ]] && SELECTOR_COUNT=$((SELECTOR_COUNT + 1))
+[[ -n "$SOURCE_NAME" ]] && SELECTOR_COUNT=$((SELECTOR_COUNT + 1))
+[[ -n "$SAMPLE_SET" ]] && SELECTOR_COUNT=$((SELECTOR_COUNT + 1))
+if (( SELECTOR_COUNT > 1 )); then
+  printf 'set only one of SOURCE_URI, SOURCE_NAME, or SAMPLE_SET\n' >&2
   exit 7
-}
+fi
 
 json_field() {
   local json_payload="$1"
@@ -135,6 +143,44 @@ print_stage() {
   printf '%s: ok=%s\n' "$stage" "$(json_field "$json_payload" "ok")" >&2
 }
 
+resolve_sources_json() {
+  if [[ -n "$SOURCE_URI" ]]; then
+    run_remote_json resolve-sources --profile "$PIPELINE_PROFILE" --source-uri "$SOURCE_URI"
+  elif [[ -n "$SOURCE_NAME" ]]; then
+    run_remote_json resolve-sources --profile "$PIPELINE_PROFILE" --source-name "$SOURCE_NAME"
+  elif [[ -n "$SAMPLE_SET" ]]; then
+    run_remote_json resolve-sources --profile "$PIPELINE_PROFILE" --sample-set "$SAMPLE_SET"
+  else
+    run_remote_json resolve-sources --profile "$PIPELINE_PROFILE"
+  fi
+}
+
+resolve_sources_args() {
+  if [[ -n "$SOURCE_URI" ]]; then
+    printf '%s\n' --profile "$PIPELINE_PROFILE" --source-uri "$SOURCE_URI"
+  elif [[ -n "$SOURCE_NAME" ]]; then
+    printf '%s\n' --profile "$PIPELINE_PROFILE" --source-name "$SOURCE_NAME"
+  elif [[ -n "$SAMPLE_SET" ]]; then
+    printf '%s\n' --profile "$PIPELINE_PROFILE" --sample-set "$SAMPLE_SET"
+  else
+    printf '%s\n' --profile "$PIPELINE_PROFILE"
+  fi
+}
+
+iter_sources() {
+  local json_payload="$1"
+  OPENCLAW_WRAPPER_JSON="$json_payload" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["OPENCLAW_WRAPPER_JSON"])
+for item in payload["data"]["sources"]:
+    name = item.get("source_name") or ""
+    uri = item["source_uri"]
+    print(f"{name}\t{uri}")
+PY
+}
+
 SYNC_STATUS=0
 SYNC_JSON="$(run_remote_json_capture git-sync --branch "$TARGET_BRANCH" --expected-commit "$EXPECTED_COMMIT")" || SYNC_STATUS=$?
 [[ -n "$SYNC_JSON" ]] || {
@@ -161,98 +207,153 @@ if [[ "$ENV_STATUS" -ne 0 || "$(json_field "$ENV_JSON" "ok")" != "true" ]]; then
   exit 2
 fi
 
-ANALYZER_JSON='null'
-if [[ "$RUN_VALIDATE_ANALYZER" == "1" ]]; then
-  ANALYZER_STATUS=0
-  ANALYZER_JSON="$(run_remote_json_capture validate-analyzer --source-uri "$SOURCE_URI")" || ANALYZER_STATUS=$?
-  [[ -n "$ANALYZER_JSON" ]] || {
-    printf 'validate-analyzer returned no JSON output\n' >&2
-    exit 7
-  }
-  ANALYZER_JSON="$(json_compact "$ANALYZER_JSON")"
-  print_stage validate-analyzer "$ANALYZER_JSON"
-  if [[ "$ANALYZER_STATUS" -ne 0 || "$(json_field "$ANALYZER_JSON" "ok")" != "true" ]]; then
-    printf '%s\n' "$ANALYZER_JSON"
-    exit 3
-  fi
-fi
-
-RUN_STATUS=0
-RUN_JSON="$(run_remote_json_capture run-pipeline --profile "$PIPELINE_PROFILE" --source-uri "$SOURCE_URI")" || RUN_STATUS=$?
-[[ -n "$RUN_JSON" ]] || {
-  printf 'run-pipeline returned no JSON output\n' >&2
+mapfile -t RESOLVE_ARGS < <(resolve_sources_args)
+RESOLVE_STATUS=0
+RESOLVE_JSON="$(run_remote_json_capture resolve-sources "${RESOLVE_ARGS[@]}")" || RESOLVE_STATUS=$?
+[[ -n "$RESOLVE_JSON" ]] || {
+  printf 'resolve-sources returned no JSON output\n' >&2
   exit 7
 }
-RUN_JSON="$(json_compact "$RUN_JSON")"
-print_stage run-pipeline "$RUN_JSON"
-if [[ "$RUN_STATUS" -ne 0 || "$(json_field "$RUN_JSON" "ok")" != "true" ]]; then
-  printf '%s\n' "$RUN_JSON"
-  exit 4
+RESOLVE_JSON="$(json_compact "$RESOLVE_JSON")"
+print_stage resolve-sources "$RESOLVE_JSON"
+if [[ "$RESOLVE_STATUS" -ne 0 || "$(json_field "$RESOLVE_JSON" "ok")" != "true" ]]; then
+  printf '%s\n' "$RESOLVE_JSON"
+  exit 3
 fi
 
-RUN_ID="$(json_field "$RUN_JSON" "data.run.run_id")"
-START_TIME="$(date +%s)"
-FINAL_STATUS_JSON=""
+ANALYZER_RESULTS_FILE="$(mktemp)"
+RUN_STARTED_FILE="$(mktemp)"
+RUN_FINAL_FILE="$(mktemp)"
+trap 'rm -f "$ANALYZER_RESULTS_FILE" "$RUN_STARTED_FILE" "$RUN_FINAL_FILE"' EXIT
 
-while true; do
-  NOW="$(date +%s)"
-  ELAPSED=$((NOW - START_TIME))
-  if (( ELAPSED > POLL_TIMEOUT_SECONDS )); then
-    printf 'polling timed out after %ss for run %s\n' "$POLL_TIMEOUT_SECONDS" "$RUN_ID" >&2
-    exit 6
+SOURCE_COUNT=0
+while IFS=$'\t' read -r RESOLVED_NAME RESOLVED_URI; do
+  [[ -n "$RESOLVED_URI" ]] || continue
+  SOURCE_COUNT=$((SOURCE_COUNT + 1))
+  printf 'source[%s]: name=%s uri=%s\n' "$SOURCE_COUNT" "${RESOLVED_NAME:-<unnamed>}" "$RESOLVED_URI" >&2
+
+  if [[ "$RUN_VALIDATE_ANALYZER" == "1" ]]; then
+    ANALYZER_STATUS=0
+    ANALYZER_JSON="$(run_remote_json_capture validate-analyzer --source-uri "$RESOLVED_URI")" || ANALYZER_STATUS=$?
+    [[ -n "$ANALYZER_JSON" ]] || {
+      printf 'validate-analyzer returned no JSON output\n' >&2
+      exit 7
+    }
+    ANALYZER_JSON="$(json_compact "$ANALYZER_JSON")"
+    print_stage validate-analyzer "$ANALYZER_JSON"
+    if [[ "$ANALYZER_STATUS" -ne 0 || "$(json_field "$ANALYZER_JSON" "ok")" != "true" ]]; then
+      printf '%s\n' "$ANALYZER_JSON"
+      exit 3
+    fi
+    printf '%s\n' "$ANALYZER_JSON" >> "$ANALYZER_RESULTS_FILE"
   fi
 
-  STATUS_PAYLOAD="$(run_remote_json get-run-status --run-id "$RUN_ID")"
-  STATUS_PAYLOAD="$(json_compact "$STATUS_PAYLOAD")"
-  RUN_STATE="$(json_field "$STATUS_PAYLOAD" "data.run.status")"
-  printf 'get-run-status: run_id=%s status=%s elapsed=%ss\n' "$RUN_ID" "$RUN_STATE" "$ELAPSED" >&2
-
-  if [[ "$RUN_STATE" == "completed" || "$RUN_STATE" == "failed" ]]; then
-    FINAL_STATUS_JSON="$STATUS_PAYLOAD"
-    break
+  RUN_STATUS=0
+  RUN_JSON="$(run_remote_json_capture run-pipeline --profile "$PIPELINE_PROFILE" --source-uri "$RESOLVED_URI")" || RUN_STATUS=$?
+  [[ -n "$RUN_JSON" ]] || {
+    printf 'run-pipeline returned no JSON output\n' >&2
+    exit 7
+  }
+  RUN_JSON="$(json_compact "$RUN_JSON")"
+  print_stage run-pipeline "$RUN_JSON"
+  if [[ "$RUN_STATUS" -ne 0 || "$(json_field "$RUN_JSON" "ok")" != "true" ]]; then
+    printf '%s\n' "$RUN_JSON"
+    exit 4
   fi
+  printf '%s\n' "$RUN_JSON" >> "$RUN_STARTED_FILE"
 
-  sleep "$POLL_INTERVAL_SECONDS"
-done
+  RUN_ID="$(json_field "$RUN_JSON" "data.run.run_id")"
+  START_TIME="$(date +%s)"
+  FINAL_STATUS_JSON=""
+
+  while true; do
+    NOW="$(date +%s)"
+    ELAPSED=$((NOW - START_TIME))
+    if (( ELAPSED > POLL_TIMEOUT_SECONDS )); then
+      printf 'polling timed out after %ss for run %s\n' "$POLL_TIMEOUT_SECONDS" "$RUN_ID" >&2
+      exit 6
+    fi
+
+    STATUS_PAYLOAD="$(run_remote_json get-run-status --run-id "$RUN_ID")"
+    STATUS_PAYLOAD="$(json_compact "$STATUS_PAYLOAD")"
+    RUN_STATE="$(json_field "$STATUS_PAYLOAD" "data.run.status")"
+    printf 'get-run-status: run_id=%s status=%s elapsed=%ss\n' "$RUN_ID" "$RUN_STATE" "$ELAPSED" >&2
+
+    if [[ "$RUN_STATE" == "completed" || "$RUN_STATE" == "failed" ]]; then
+      FINAL_STATUS_JSON="$STATUS_PAYLOAD"
+      break
+    fi
+
+    sleep "$POLL_INTERVAL_SECONDS"
+  done
+
+  printf '%s\n' "$FINAL_STATUS_JSON" >> "$RUN_FINAL_FILE"
+done < <(iter_sources "$RESOLVE_JSON")
+
+if (( SOURCE_COUNT == 0 )); then
+  printf 'resolve-sources returned no sources\n' >&2
+  exit 7
+fi
 
 RESULT_JSON="$(
   OPENCLAW_SYNC_JSON="$SYNC_JSON" \
   OPENCLAW_ENV_JSON="$ENV_JSON" \
-  OPENCLAW_ANALYZER_JSON="$ANALYZER_JSON" \
-  OPENCLAW_RUN_JSON="$RUN_JSON" \
-  OPENCLAW_FINAL_STATUS_JSON="$FINAL_STATUS_JSON" \
+  OPENCLAW_RESOLVE_JSON="$RESOLVE_JSON" \
+  OPENCLAW_ANALYZER_RESULTS_FILE="$ANALYZER_RESULTS_FILE" \
+  OPENCLAW_RUN_STARTED_FILE="$RUN_STARTED_FILE" \
+  OPENCLAW_RUN_FINAL_FILE="$RUN_FINAL_FILE" \
   python3 - <<'PY'
 import json
 import os
 
 sync = json.loads(os.environ["OPENCLAW_SYNC_JSON"])
 env = json.loads(os.environ["OPENCLAW_ENV_JSON"])
-analyzer_raw = os.environ["OPENCLAW_ANALYZER_JSON"]
-analyzer = None if analyzer_raw == "null" else json.loads(analyzer_raw)
-run_start = json.loads(os.environ["OPENCLAW_RUN_JSON"])
-run_final = json.loads(os.environ["OPENCLAW_FINAL_STATUS_JSON"])
+resolve = json.loads(os.environ["OPENCLAW_RESOLVE_JSON"])
 
-run_info = run_final["data"]["run"]
-artifacts = run_info.get("artifacts", [])
-base_chart = next((item["uri"] for item in artifacts if item.get("type") == "base_chart"), None)
-normalized = next((item["uri"] for item in artifacts if item.get("type") == "normalized_analysis"), None)
-audio_analysis = next((item["uri"] for item in artifacts if item.get("type") == "audio_analysis"), None)
+def load_json_lines(path_env):
+    path = os.environ[path_env]
+    with open(path, "r", encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
 
-status = "validation-passed" if run_info["status"] == "completed" and run_info.get("exit_code") == 0 else "validation-failed"
+analyzer_results = load_json_lines("OPENCLAW_ANALYZER_RESULTS_FILE")
+run_started = load_json_lines("OPENCLAW_RUN_STARTED_FILE")
+run_final = load_json_lines("OPENCLAW_RUN_FINAL_FILE")
+
+all_artifacts = []
+base_charts = []
+normalized_artifacts = []
+audio_analysis_artifacts = []
+overall_ok = True
+
+for item in run_final:
+    run_info = item["data"]["run"]
+    if run_info["status"] != "completed" or run_info.get("exit_code") != 0:
+        overall_ok = False
+    for artifact in run_info.get("artifacts", []):
+        all_artifacts.append(artifact)
+        if artifact.get("type") == "base_chart":
+            base_charts.append(artifact["uri"])
+        elif artifact.get("type") == "normalized_analysis":
+            normalized_artifacts.append(artifact["uri"])
+        elif artifact.get("type") == "audio_analysis":
+            audio_analysis_artifacts.append(artifact["uri"])
+
+status = "validation-passed" if overall_ok else "validation-failed"
 
 payload = {
     "status": status,
-    "repo": run_final["data"]["repo"],
+    "repo": resolve["data"]["repo"],
     "sync": sync["data"]["git"],
     "env_check": env["data"],
-    "validate_analyzer": None if analyzer is None else analyzer["data"],
-    "run_started": run_start["data"]["run"],
-    "run_final": run_info,
+    "resolved_sources": resolve["data"]["sources"],
+    "validate_analyzer": [item["data"] for item in analyzer_results],
+    "runs_started": [item["data"]["run"] for item in run_started],
+    "runs_final": [item["data"]["run"] for item in run_final],
     "artifacts": {
-        "base_chart": base_chart,
-        "normalized_analysis": normalized,
-        "audio_analysis": audio_analysis,
-        "all": artifacts,
+        "base_chart": base_charts[0] if len(base_charts) == 1 else base_charts,
+        "normalized_analysis": normalized_artifacts[0] if len(normalized_artifacts) == 1 else normalized_artifacts,
+        "audio_analysis": audio_analysis_artifacts[0] if len(audio_analysis_artifacts) == 1 else audio_analysis_artifacts,
+        "all": all_artifacts,
     },
 }
 print(json.dumps(payload, separators=(",", ":")))
