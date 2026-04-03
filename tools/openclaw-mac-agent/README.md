@@ -96,6 +96,24 @@ From Linux/OpenClaw, use:
 bash ./scripts/test-openclaw-mac-agent-remote.sh
 ```
 
+If you want a reusable local config on Linux, start from:
+
+```text
+scripts/test-openclaw-mac-agent-remote.env.example
+```
+
+and load it like this:
+
+```bash
+cp scripts/test-openclaw-mac-agent-remote.env.example scripts/test-openclaw-mac-agent-remote.env
+set -a
+source scripts/test-openclaw-mac-agent-remote.env
+set +a
+bash ./scripts/test-openclaw-mac-agent-remote.sh
+```
+
+Update `MAC_AGENT_LOG_ROOT` and `MAC_AGENT_LOG_PATH` in that env file to match a real log file in the target repo.
+
 to exercise the real forced-command path with:
 
 - `env-check`

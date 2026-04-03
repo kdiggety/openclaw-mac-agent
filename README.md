@@ -220,6 +220,14 @@ For a simple Linux-side smoke test of that path, use:
 bash ./scripts/test-openclaw-mac-agent-remote.sh
 ```
 
+There is also a checked-in example env file for the Linux side:
+
+```text
+scripts/test-openclaw-mac-agent-remote.env.example
+```
+
+Load it before running the remote smoke script if you want stable local defaults for the SSH key, repo name, and log path.
+
 For Mac-side setup of the `openclaw-mac-agent` config and SSH wrapper path, use:
 
 ```bash
