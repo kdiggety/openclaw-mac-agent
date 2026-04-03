@@ -4,6 +4,8 @@
 
 `mac_worker` is a reusable macOS-side worker for Apple build, test, simulator, launch, screenshot, and log collection tasks. The Linux orchestrator stays in charge; the Mac only exposes a narrow execution surface.
 
+If you need broader repo inspection, file reading, analyzer validation, or bounded pipeline-style runs over the same forced-command security model, use the complementary [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/openclaw-mac-agent/README.md`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/openclaw-mac-agent/README.md) surface instead of extending `mac_worker` into a generic remote shell.
+
 `v1` expects `python3`, Xcode command line tools, and the normal Apple developer utilities (`xcodebuild`, `xcrun`, `simctl`, `log`, `screencapture`) to be available on the Mac.
 
 ## Commands

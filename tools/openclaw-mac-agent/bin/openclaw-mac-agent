@@ -1,0 +1,919 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = BASE_DIR / "config" / "repos.json"
+DEFAULT_CONFIG_EXAMPLE = BASE_DIR / "config" / "repos.example.json"
+DEFAULT_AGENT_HOME = Path.home() / ".openclaw-mac-agent"
+PATH_ENV = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+MAX_STDOUT_BYTES = 32768
+MAX_STDERR_BYTES = 32768
+MAX_COMBINED_BYTES = 65536
+MAX_READ_BYTES = 65536
+MAX_TAIL_LINES = 500
+MAX_LIST_ITEMS = 500
+PUBLIC_VERBS = {
+    "env-check",
+    "repo-status",
+    "read-file",
+    "tail-file",
+    "list-artifacts",
+    "summarize-artifact",
+    "validate-analyzer",
+    "run-pipeline",
+    "get-run-status",
+    "git-fetch",
+    "git-pull",
+}
+TEXT_EXTENSIONS = {
+    ".json",
+    ".txt",
+    ".log",
+    ".md",
+    ".csv",
+    ".yaml",
+    ".yml",
+    ".swift",
+    ".py",
+    ".sh",
+}
+
+
+class AgentError(Exception):
+    def __init__(self, code: str, message: str, exit_code: int = 22, details: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.exit_code = exit_code
+        self.details = details or {}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def make_request_id() -> str:
+    return f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+
+def truncate_text(text: str, limit: int) -> Tuple[str, bool, int]:
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= limit:
+        return text, False, len(encoded)
+    trimmed = encoded[:limit].decode("utf-8", errors="replace")
+    return trimmed, True, len(encoded)
+
+
+def load_config(config_path: Optional[str]) -> Dict[str, Any]:
+    if config_path:
+        path = Path(config_path).expanduser()
+    elif DEFAULT_CONFIG.exists():
+        path = DEFAULT_CONFIG
+    else:
+        path = DEFAULT_CONFIG_EXAMPLE
+
+    if not path.exists():
+        raise AgentError("CONFIG_MISSING", f"Config file not found: {path}", 22)
+
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    payload["_config_path"] = str(path)
+    return payload
+
+
+def ensure_agent_home(agent_home: Path) -> None:
+    (agent_home / "logs").mkdir(parents=True, exist_ok=True)
+
+
+def audit_log(agent_home: Path, record: Dict[str, Any]) -> None:
+    ensure_agent_home(agent_home)
+    with (agent_home / "logs" / "audit.log").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, separators=(",", ":")))
+        handle.write("\n")
+
+
+def response_envelope(
+    *,
+    ok: bool,
+    verb: str,
+    request_id: str,
+    exit_code: int,
+    started_at: float,
+    data: Any = None,
+    stdout: str = "",
+    stderr: str = "",
+    warnings: Optional[List[Any]] = None,
+    error: Optional[Dict[str, Any]] = None,
+    truncation: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    duration_ms = int((time.time() - started_at) * 1000)
+    payload = {
+        "ok": ok,
+        "verb": verb,
+        "request_id": request_id,
+        "exit_code": exit_code,
+        "duration_ms": duration_ms,
+        "truncated": bool(truncation and (truncation.get("stdout_truncated") or truncation.get("stderr_truncated"))),
+        "stdout": stdout,
+        "stderr": stderr,
+        "data": data,
+        "warnings": warnings or [],
+        "error": error,
+    }
+    payload["limits"] = {
+        "max_stdout_bytes": MAX_STDOUT_BYTES,
+        "max_stderr_bytes": MAX_STDERR_BYTES,
+        "max_combined_bytes": MAX_COMBINED_BYTES,
+    }
+    payload["truncation"] = truncation or {
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+        "stdout_original_bytes": len(stdout.encode("utf-8")),
+        "stderr_original_bytes": len(stderr.encode("utf-8")),
+    }
+    return payload
+
+
+def emit_json(payload: Dict[str, Any]) -> None:
+    print(json.dumps(payload, separators=(",", ":")))
+
+
+def parse_repo(config: Dict[str, Any], repo_name: str) -> Dict[str, Any]:
+    repos = config.get("repos") or {}
+    if repo_name not in repos:
+        raise AgentError("UNKNOWN_REPO", f"Unknown repo: {repo_name}", 22, {"repo": repo_name})
+    repo_config = repos[repo_name]
+    repo_path = Path(repo_config["path"]).expanduser().resolve()
+    if not repo_path.exists():
+        raise AgentError("REPO_MISSING", f"Repo path not found: {repo_path}", 22, {"repo": repo_name, "path": str(repo_path)})
+
+    roots_template = {
+        "repo": "{repo}",
+        "logs": "{repo}/logs",
+        "artifacts": "{repo}/output",
+        "tmp": "{repo}/tmp",
+        "runs": "{repo}/runs",
+    }
+    roots_template.update(config.get("roots") or {})
+    roots_template.update(repo_config.get("roots") or {})
+
+    roots: Dict[str, Path] = {}
+    for name, template in roots_template.items():
+        roots[name] = Path(str(template).format(repo=str(repo_path))).expanduser().resolve()
+
+    return {
+        "name": repo_name,
+        "path": repo_path,
+        "config": repo_config,
+        "roots": roots,
+    }
+
+
+def ensure_relative_path(path_value: str) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        raise AgentError("ABSOLUTE_PATH_REJECTED", "Absolute paths are not allowed", 22, {"path": path_value})
+    if not path.parts:
+        raise AgentError("EMPTY_PATH", "Path must not be empty", 22)
+    if any(part == ".." for part in path.parts):
+        raise AgentError("PARENT_PATH_REJECTED", "Parent path traversal is not allowed", 22, {"path": path_value})
+    return path
+
+
+def ensure_within_root(root: Path, candidate: Path) -> Path:
+    resolved = candidate.resolve()
+    try:
+        if os.path.commonpath([str(root), str(resolved)]) != str(root):
+            raise AgentError("PATH_OUTSIDE_ALLOWED_ROOT", "Resolved path is outside approved root", 22, {"root": str(root), "path": str(resolved)})
+    except ValueError:
+        raise AgentError("PATH_OUTSIDE_ALLOWED_ROOT", "Resolved path is outside approved root", 22, {"root": str(root), "path": str(resolved)})
+    return resolved
+
+
+def resolve_root(repo_info: Dict[str, Any], root_name: str) -> Path:
+    roots = repo_info["roots"]
+    if root_name not in roots:
+        raise AgentError("UNKNOWN_ROOT", f"Unknown root: {root_name}", 22, {"root": root_name})
+    return roots[root_name]
+
+
+def resolve_repo_path(repo_info: Dict[str, Any], root_name: str, relative_path: str, must_exist: bool = True) -> Path:
+    root = resolve_root(repo_info, root_name)
+    rel = ensure_relative_path(relative_path)
+    candidate = root / rel
+    if must_exist and not candidate.exists():
+        raise AgentError("PATH_NOT_FOUND", f"Path not found: {candidate}", 22, {"path": relative_path, "root": root_name})
+    if must_exist:
+        return ensure_within_root(root, candidate)
+    return ensure_within_root(root, candidate.parent) / candidate.name
+
+
+def file_is_text(path: Path) -> bool:
+    if path.suffix.lower() in TEXT_EXTENSIONS:
+        return True
+    with path.open("rb") as handle:
+        sample = handle.read(1024)
+    return b"\x00" not in sample
+
+
+def build_env(repo_info: Dict[str, Any], run_dir: Optional[Path] = None) -> Dict[str, str]:
+    repo_path = repo_info["path"]
+    tmp_dir = repo_info["roots"]["tmp"]
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    env = {
+        "HOME": str(Path.home()),
+        "USER": os.environ.get("USER", ""),
+        "LOGNAME": os.environ.get("LOGNAME", ""),
+        "PATH": PATH_ENV,
+        "TMPDIR": str(tmp_dir),
+        "PYTHONUNBUFFERED": "1",
+    }
+    if run_dir:
+        env["OPENCLAW_RUN_DIR"] = str(run_dir)
+    return env
+
+
+def resolve_executable(argv0: str, repo_info: Dict[str, Any]) -> Path:
+    candidate = Path(argv0)
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+    else:
+        which = shutil.which(argv0, path=PATH_ENV)
+        if which is None:
+            raise AgentError("BINARY_NOT_FOUND", f"Executable not found: {argv0}", 22, {"argv0": argv0})
+        resolved = Path(which).resolve()
+
+    allowed = {
+        Path("/usr/bin/env"),
+        Path("/usr/bin/xcrun"),
+        Path("/usr/bin/xcode-select"),
+        Path("/usr/bin/git"),
+        Path("/usr/bin/python3"),
+        Path("/opt/homebrew/bin/python3"),
+        Path("/usr/bin/swift"),
+        Path("/opt/homebrew/bin/ffmpeg"),
+        Path("/opt/homebrew/bin/ffprobe"),
+    }
+    repo_path = repo_info["path"]
+    venv_python = (repo_path / ".venv" / "bin" / "python").resolve() if (repo_path / ".venv" / "bin" / "python").exists() else None
+
+    if resolved in allowed:
+        return resolved
+    if venv_python and resolved == venv_python:
+        return resolved
+    try:
+        if os.path.commonpath([str(repo_path), str(resolved)]) == str(repo_path):
+            return resolved
+    except ValueError:
+        pass
+    raise AgentError("BINARY_NOT_ALLOWED", f"Executable is not allowlisted: {resolved}", 22, {"argv0": argv0, "resolved": str(resolved)})
+
+
+def run_subprocess(
+    argv: List[str],
+    *,
+    repo_info: Dict[str, Any],
+    cwd: Optional[Path] = None,
+    timeout: int,
+    run_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    executable = resolve_executable(argv[0], repo_info)
+    argv = [str(executable), *argv[1:]]
+    cwd = cwd or repo_info["path"]
+    env = build_env(repo_info, run_dir)
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AgentError("TIMEOUT", "Command exceeded timeout", 124, {"timeout_seconds": timeout, "argv": argv, "stdout": exc.stdout or "", "stderr": exc.stderr or ""})
+
+    combined = (completed.stdout or "") + (completed.stderr or "")
+    stdout_text, stdout_truncated, stdout_original = truncate_text(completed.stdout or "", MAX_STDOUT_BYTES)
+    stderr_text, stderr_truncated, stderr_original = truncate_text(completed.stderr or "", MAX_STDERR_BYTES)
+    if len(combined.encode("utf-8", errors="replace")) > MAX_COMBINED_BYTES:
+        overflow = len(combined.encode("utf-8", errors="replace")) - MAX_COMBINED_BYTES
+        if not stderr_truncated:
+            stderr_text = truncate_text(stderr_text, max(0, len(stderr_text.encode("utf-8")) - overflow))[0]
+            stderr_truncated = True
+
+    return {
+        "argv": argv,
+        "status": completed.returncode,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+        "truncation": {
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+            "stdout_original_bytes": stdout_original,
+            "stderr_original_bytes": stderr_original,
+        },
+    }
+
+
+def repo_status_lines(repo_info: Dict[str, Any]) -> List[str]:
+    result = run_subprocess(["git", "status", "--short"], repo_info=repo_info, timeout=10)
+    lines = [line for line in result["stdout"].splitlines() if line.strip()]
+    return lines[:200]
+
+
+def handler_env_check(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    tools = {}
+    for label, argv in (
+        ("xcode_select", ["xcode-select", "-p"]),
+        ("swift", ["swift", "--version"]),
+        ("python3", ["python3", "--version"]),
+        ("git", ["git", "--version"]),
+    ):
+        try:
+            result = run_subprocess(argv, repo_info=repo_info, timeout=10)
+            tools[label] = {"ok": result["status"] == 0, "version": (result["stdout"] or result["stderr"]).strip()}
+        except AgentError as exc:
+            tools[label] = {"ok": False, "error": exc.message}
+
+    ffmpeg_path = shutil.which("ffmpeg", path=PATH_ENV)
+    if ffmpeg_path:
+        ffmpeg_result = run_subprocess(["ffmpeg", "-version"], repo_info=repo_info, timeout=10)
+        tools["ffmpeg"] = {"ok": ffmpeg_result["status"] == 0, "version": (ffmpeg_result["stdout"] or ffmpeg_result["stderr"]).splitlines()[0] if (ffmpeg_result["stdout"] or ffmpeg_result["stderr"]) else ""}
+    else:
+        tools["ffmpeg"] = {"ok": False, "error": "ffmpeg not found"}
+
+    venv_python = repo_info["path"] / ".venv" / "bin" / "python"
+    if venv_python.exists():
+        venv_result = run_subprocess([str(venv_python), "--version"], repo_info=repo_info, timeout=10)
+        tools["repo_venv_python"] = {
+            "ok": venv_result["status"] == 0,
+            "path": str(venv_python),
+            "version": (venv_result["stdout"] or venv_result["stderr"]).strip(),
+        }
+    else:
+        tools["repo_venv_python"] = {"ok": False, "path": str(venv_python), "error": "venv missing"}
+
+    return {
+        "repo": {"name": repo_info["name"], "path": str(repo_info["path"]), "exists": True},
+        "platform": {"os": "macOS", "version": platform.mac_ver()[0], "arch": platform.machine()},
+        "tools": tools,
+        "roots": {name: str(path) for name, path in repo_info["roots"].items()},
+        "config_path": config["_config_path"],
+    }
+
+
+def handler_repo_status(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    branch = run_subprocess(["git", "branch", "--show-current"], repo_info=repo_info, timeout=10)
+    head = run_subprocess(["git", "rev-parse", "HEAD"], repo_info=repo_info, timeout=10)
+    status_lines = repo_status_lines(repo_info)
+    remote = run_subprocess(["git", "remote", "-v"], repo_info=repo_info, timeout=10)
+    return {
+        "repo": {"name": repo_info["name"], "path": str(repo_info["path"])},
+        "git": {
+            "branch": branch["stdout"].strip(),
+            "head": head["stdout"].strip(),
+            "is_dirty": bool(status_lines),
+            "changed_files": len([line for line in status_lines if not line.startswith("??")]),
+            "untracked_files": len([line for line in status_lines if line.startswith("??")]),
+            "status_short": status_lines,
+            "remotes": remote["stdout"].splitlines(),
+        },
+        "paths": {
+            "venv_exists": (repo_info["path"] / ".venv").exists(),
+            "logs_dir_exists": repo_info["roots"]["logs"].exists(),
+            "artifacts_dir_exists": repo_info["roots"]["artifacts"].exists(),
+            "runs_dir_exists": repo_info["roots"]["runs"].exists(),
+        },
+    }
+
+
+def handler_read_file(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    max_bytes = min(args.max_bytes, MAX_READ_BYTES)
+    path = resolve_repo_path(repo_info, args.root, args.path, must_exist=True)
+    if not path.is_file():
+        raise AgentError("NOT_A_FILE", f"Path is not a file: {path}", 22)
+    if not file_is_text(path):
+        raise AgentError("BINARY_FILE_REJECTED", "Binary files are not supported in v1", 22, {"path": str(path)})
+    content = path.read_text(encoding="utf-8", errors="replace")
+    content_text, truncated, original_bytes = truncate_text(content, max_bytes)
+    return {
+        "file": {
+            "root": args.root,
+            "relative_path": args.path,
+            "resolved_path": str(path),
+            "size_bytes": path.stat().st_size,
+            "mtime": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "content_type": "text/plain",
+            "encoding": "utf-8",
+            "truncated": truncated,
+            "original_bytes": original_bytes,
+        },
+        "content": content_text,
+    }
+
+
+def handler_tail_file(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    lines_requested = min(args.lines, MAX_TAIL_LINES)
+    path = resolve_repo_path(repo_info, args.root, args.path, must_exist=True)
+    if not path.is_file():
+        raise AgentError("NOT_A_FILE", f"Path is not a file: {path}", 22)
+    if not file_is_text(path):
+        raise AgentError("BINARY_FILE_REJECTED", "Binary files are not supported in v1", 22, {"path": str(path)})
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    selected = lines[-lines_requested:]
+    text = "\n".join(selected)
+    tail_text, truncated, original_bytes = truncate_text(text, MAX_READ_BYTES)
+    return {
+        "file": {
+            "root": args.root,
+            "relative_path": args.path,
+            "resolved_path": str(path),
+            "size_bytes": path.stat().st_size,
+            "mtime": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+        "tail": {
+            "requested_lines": lines_requested,
+            "returned_lines": len(selected),
+            "text": tail_text,
+            "truncated": truncated,
+            "original_bytes": original_bytes,
+        },
+    }
+
+
+def handler_list_artifacts(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    root = resolve_root(repo_info, args.root)
+    base = root
+    if args.path:
+        base = resolve_repo_path(repo_info, args.root, args.path, must_exist=False)
+    if not base.exists():
+        return {"artifacts_root": str(base), "items": []}
+
+    items: List[Dict[str, Any]] = []
+    if base.is_file():
+        rel = base.relative_to(root)
+        items.append({
+            "path": str(rel),
+            "size_bytes": base.stat().st_size,
+            "mtime": datetime.fromtimestamp(base.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "kind": base.suffix.lower().lstrip(".") or "file",
+        })
+    else:
+        for path in sorted(base.rglob("*"), key=lambda item: item.stat().st_mtime if item.exists() else 0, reverse=True):
+            if len(items) >= MAX_LIST_ITEMS:
+                break
+            if not path.is_file():
+                continue
+            rel = path.relative_to(root)
+            items.append({
+                "path": str(rel),
+                "size_bytes": path.stat().st_size,
+                "mtime": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "kind": path.suffix.lower().lstrip(".") or "file",
+            })
+    return {"artifacts_root": str(root), "items": items}
+
+
+def summarize_json(path: Path) -> Dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    summary: Dict[str, Any] = {"top_level_type": type(payload).__name__.lower()}
+    if isinstance(payload, dict):
+        summary["top_level_keys"] = list(payload.keys())[:50]
+        for key in ("events", "tempo_map", "songs", "items"):
+            if key in payload and isinstance(payload[key], list):
+                summary[f"{key}_count"] = len(payload[key])
+    elif isinstance(payload, list):
+        summary["length"] = len(payload)
+    return summary
+
+
+def summarize_csv(path: Path) -> Dict[str, Any]:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    header = lines[0].split(",") if lines else []
+    return {"rows": max(0, len(lines) - 1), "cols": len(header), "header": header[:50]}
+
+
+def summarize_text(path: Path) -> Dict[str, Any]:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return {
+        "line_count": len(lines),
+        "head": "\n".join(lines[:10]),
+        "tail": "\n".join(lines[-10:]),
+    }
+
+
+def handler_summarize_artifact(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    root_name = args.root or "repo"
+    path = resolve_repo_path(repo_info, root_name, args.path, must_exist=True)
+    if path.suffix.lower() == ".json":
+        summary = summarize_json(path)
+        kind = "json"
+    elif path.suffix.lower() == ".csv":
+        summary = summarize_csv(path)
+        kind = "csv"
+    else:
+        if not file_is_text(path):
+            raise AgentError("BINARY_FILE_REJECTED", "Binary artifacts are not summarized in v1", 22, {"path": str(path)})
+        summary = summarize_text(path)
+        kind = "text"
+    return {
+        "artifact": {
+            "path": args.path,
+            "resolved_path": str(path),
+            "kind": kind,
+            "size_bytes": path.stat().st_size,
+        },
+        "summary": summary,
+    }
+
+
+def ensure_file_uri(source_uri: str) -> Path:
+    if not source_uri.startswith("file://"):
+        raise AgentError("UNSUPPORTED_SOURCE_URI", "Only file:// URIs are supported in v1", 22, {"source_uri": source_uri})
+    path = Path(source_uri[7:])
+    if not path.exists():
+        raise AgentError("SOURCE_NOT_FOUND", f"Source file not found: {path}", 22, {"source_uri": source_uri})
+    return path.resolve()
+
+
+def render_template_list(items: List[str], repo_info: Dict[str, Any], extra: Optional[Dict[str, str]] = None) -> List[str]:
+    mapping = {"repo": str(repo_info["path"])}
+    mapping.update({f"root_{name}": str(path) for name, path in repo_info["roots"].items()})
+    mapping.update(extra or {})
+    return [item.format(**mapping) for item in items]
+
+
+def handler_validate_analyzer(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    source_uri_checked = False
+    source_path = None
+    if args.source_uri:
+        source_path = ensure_file_uri(args.source_uri)
+        source_uri_checked = True
+
+    venv_python = repo_info["path"] / ".venv" / "bin" / "python"
+    repo_cfg = repo_info["config"]
+    logs = []
+    validation = {
+        "venv_present": venv_python.exists(),
+        "imports_ok": False,
+        "config_ok": True,
+        "ffmpeg_ok": shutil.which("ffmpeg", path=PATH_ENV) is not None,
+        "source_uri_checked": source_uri_checked,
+    }
+
+    recipe = (repo_cfg.get("recipes") or {}).get("validate-analyzer")
+    if recipe:
+        argv = render_template_list(recipe["argv"], repo_info, {"source_uri": args.source_uri or "", "source_path": str(source_path or "")})
+        timeout = int(recipe.get("timeout_seconds", 60))
+        result = run_subprocess(argv, repo_info=repo_info, timeout=timeout)
+        validation["imports_ok"] = result["status"] == 0
+        logs.append({"stdout": result["stdout"], "stderr": result["stderr"]})
+        if result["status"] != 0:
+            raise AgentError("VALIDATE_ANALYZER_FAILED", "Analyzer validation failed", result["status"], {"stdout": result["stdout"], "stderr": result["stderr"]})
+    else:
+        validation["imports_ok"] = venv_python.exists() or shutil.which("python3", path=PATH_ENV) is not None
+
+    return {"repo": repo_info["name"], "validation": validation, "logs": logs}
+
+
+def run_dir_status_path(run_dir: Path) -> Path:
+    return run_dir / "status.json"
+
+
+def read_status_file(run_dir: Path) -> Dict[str, Any]:
+    status_path = run_dir_status_path(run_dir)
+    if not status_path.exists():
+        raise AgentError("RUN_NOT_FOUND", f"Run status not found: {status_path}", 22, {"run_dir": str(run_dir)})
+    return json.loads(status_path.read_text(encoding="utf-8"))
+
+
+def write_status_file(run_dir: Path, payload: Dict[str, Any]) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir_status_path(run_dir).write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+
+def handler_run_pipeline(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    source_path = ensure_file_uri(args.source_uri)
+    profiles = (repo_info["config"].get("pipeline_profiles") or {})
+    if args.profile not in profiles:
+        raise AgentError("UNKNOWN_PROFILE", f"Unknown pipeline profile: {args.profile}", 22, {"profile": args.profile})
+
+    run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    run_dir = repo_info["roots"]["runs"] / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    stdout_log = run_dir / "stdout.log"
+    stderr_log = run_dir / "stderr.log"
+    recipe = profiles[args.profile]
+    argv = render_template_list(recipe["argv"], repo_info, {"source_uri": args.source_uri, "source_path": str(source_path), "run_dir": str(run_dir)})
+    timeout = int(recipe.get("timeout_seconds", 600))
+    child_env = build_env(repo_info, run_dir)
+    child_env["OPENCLAW_MAC_AGENT_CONFIG"] = str(config["_config_path"])
+
+    status_payload = {
+        "run_id": run_id,
+        "repo": repo_info["name"],
+        "profile": args.profile,
+        "source_uri": args.source_uri,
+        "status": "running",
+        "started_at": utc_now(),
+        "finished_at": None,
+        "duration_ms": None,
+        "exit_code": None,
+        "run_dir": str(run_dir),
+        "stdout_log": str(stdout_log),
+        "stderr_log": str(stderr_log),
+        "timeout_seconds": timeout,
+    }
+    write_status_file(run_dir, status_payload)
+
+    helper_argv = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "__run-profile",
+        "--config",
+        str(config["_config_path"]),
+        "--repo",
+        repo_info["name"],
+        "--run-id",
+        run_id,
+        "--profile",
+        args.profile,
+        "--source-uri",
+        args.source_uri,
+    ]
+    with stdout_log.open("a", encoding="utf-8") as stdout_handle, stderr_log.open("a", encoding="utf-8") as stderr_handle:
+        process = subprocess.Popen(
+            helper_argv,
+            cwd=str(repo_info["path"]),
+            env=child_env,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            start_new_session=True,
+        )
+
+    status_payload["pid"] = process.pid
+    write_status_file(run_dir, status_payload)
+    return {
+        "repo": repo_info["name"],
+        "run": {
+            "run_id": run_id,
+            "profile": args.profile,
+            "source_uri": args.source_uri,
+            "started_at": status_payload["started_at"],
+            "finished_at": None,
+            "duration_ms": None,
+            "exit_code": None,
+            "status": "running",
+        },
+        "paths": {
+            "run_dir": str(run_dir),
+            "stdout_log": str(stdout_log),
+            "stderr_log": str(stderr_log),
+        },
+        "artifacts": [],
+    }
+
+
+def internal_run_profile(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    repo_info = parse_repo(config, args.repo)
+    profiles = (repo_info["config"].get("pipeline_profiles") or {})
+    recipe = profiles[args.profile]
+    run_dir = repo_info["roots"]["runs"] / args.run_id
+    argv = render_template_list(recipe["argv"], repo_info, {"source_uri": args.source_uri, "source_path": str(ensure_file_uri(args.source_uri)), "run_dir": str(run_dir)})
+    timeout = int(recipe.get("timeout_seconds", 600))
+    start_time = time.time()
+
+    try:
+        executable = resolve_executable(argv[0], repo_info)
+        argv = [str(executable), *argv[1:]]
+        process = subprocess.run(
+            argv,
+            cwd=str(repo_info["path"]),
+            env=build_env(repo_info, run_dir),
+            timeout=timeout,
+            check=False,
+        )
+        status_payload = read_status_file(run_dir)
+        status_payload["status"] = "completed" if process.returncode == 0 else "failed"
+        status_payload["finished_at"] = utc_now()
+        status_payload["duration_ms"] = int((time.time() - start_time) * 1000)
+        status_payload["exit_code"] = process.returncode
+        write_status_file(run_dir, status_payload)
+        return process.returncode
+    except AgentError as exc:
+        status_payload = read_status_file(run_dir)
+        status_payload["status"] = "failed"
+        status_payload["finished_at"] = utc_now()
+        status_payload["duration_ms"] = int((time.time() - start_time) * 1000)
+        status_payload["exit_code"] = exc.exit_code
+        status_payload["error"] = {"code": exc.code, "message": exc.message, "details": exc.details}
+        write_status_file(run_dir, status_payload)
+        return exc.exit_code
+
+
+def handler_get_run_status(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    run_dir = resolve_repo_path(repo_info, "runs", args.run_id, must_exist=True)
+    status_payload = read_status_file(run_dir)
+    return {
+        "repo": repo_info["name"],
+        "run": status_payload,
+    }
+
+
+def ensure_clean_tree(repo_info: Dict[str, Any]) -> None:
+    if repo_status_lines(repo_info):
+        raise AgentError("CLEAN_TREE_REQUIRED", "Repository must be clean for this operation", 22, {"repo": repo_info["name"]})
+
+
+def handler_git_fetch(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    result = run_subprocess(["git", "fetch", "--prune"], repo_info=repo_info, timeout=30)
+    return {
+        "repo": repo_info["name"],
+        "git": {"operation": "fetch", "exit_code": result["status"]},
+        "stdout": result["stdout"],
+        "stderr": result["stderr"],
+    }
+
+
+def handler_git_pull(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    if not args.ff_only:
+        raise AgentError("FF_ONLY_REQUIRED", "git-pull requires --ff-only", 22)
+    ensure_clean_tree(repo_info)
+    result = run_subprocess(["git", "pull", "--ff-only"], repo_info=repo_info, timeout=30)
+    return {
+        "repo": repo_info["name"],
+        "git": {"operation": "pull", "mode": "ff-only", "exit_code": result["status"]},
+        "stdout": result["stdout"],
+        "stderr": result["stderr"],
+    }
+
+
+HANDLERS = {
+    "env-check": handler_env_check,
+    "repo-status": handler_repo_status,
+    "read-file": handler_read_file,
+    "tail-file": handler_tail_file,
+    "list-artifacts": handler_list_artifacts,
+    "summarize-artifact": handler_summarize_artifact,
+    "validate-analyzer": handler_validate_analyzer,
+    "run-pipeline": handler_run_pipeline,
+    "get-run-status": handler_get_run_status,
+    "git-fetch": handler_git_fetch,
+    "git-pull": handler_git_pull,
+}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="openclaw-mac-agent")
+    parser.add_argument("--config", default=os.environ.get("OPENCLAW_MAC_AGENT_CONFIG"))
+    subparsers = parser.add_subparsers(dest="verb", required=True)
+
+    parser_env = subparsers.add_parser("env-check")
+    parser_env.add_argument("--repo", required=True)
+    parser_env.add_argument("--json", action="store_true")
+
+    parser_status = subparsers.add_parser("repo-status")
+    parser_status.add_argument("--repo", required=True)
+    parser_status.add_argument("--json", action="store_true")
+
+    parser_read = subparsers.add_parser("read-file")
+    parser_read.add_argument("--repo", required=True)
+    parser_read.add_argument("--root", default="repo")
+    parser_read.add_argument("--path", required=True)
+    parser_read.add_argument("--max-bytes", type=int, default=32768)
+    parser_read.add_argument("--json", action="store_true")
+
+    parser_tail = subparsers.add_parser("tail-file")
+    parser_tail.add_argument("--repo", required=True)
+    parser_tail.add_argument("--root", default="logs")
+    parser_tail.add_argument("--path", required=True)
+    parser_tail.add_argument("--lines", type=int, default=200)
+    parser_tail.add_argument("--json", action="store_true")
+
+    parser_list = subparsers.add_parser("list-artifacts")
+    parser_list.add_argument("--repo", required=True)
+    parser_list.add_argument("--root", default="artifacts")
+    parser_list.add_argument("--path", default="")
+    parser_list.add_argument("--json", action="store_true")
+
+    parser_summary = subparsers.add_parser("summarize-artifact")
+    parser_summary.add_argument("--repo", required=True)
+    parser_summary.add_argument("--root", default="repo")
+    parser_summary.add_argument("--path", required=True)
+    parser_summary.add_argument("--json", action="store_true")
+
+    parser_validate = subparsers.add_parser("validate-analyzer")
+    parser_validate.add_argument("--repo", required=True)
+    parser_validate.add_argument("--source-uri")
+    parser_validate.add_argument("--json", action="store_true")
+
+    parser_run = subparsers.add_parser("run-pipeline")
+    parser_run.add_argument("--repo", required=True)
+    parser_run.add_argument("--source-uri", required=True)
+    parser_run.add_argument("--profile", required=True)
+    parser_run.add_argument("--json", action="store_true")
+
+    parser_run_status = subparsers.add_parser("get-run-status")
+    parser_run_status.add_argument("--repo", required=True)
+    parser_run_status.add_argument("--run-id", required=True)
+    parser_run_status.add_argument("--json", action="store_true")
+
+    parser_fetch = subparsers.add_parser("git-fetch")
+    parser_fetch.add_argument("--repo", required=True)
+    parser_fetch.add_argument("--json", action="store_true")
+
+    parser_pull = subparsers.add_parser("git-pull")
+    parser_pull.add_argument("--repo", required=True)
+    parser_pull.add_argument("--ff-only", action="store_true", required=False)
+    parser_pull.add_argument("--json", action="store_true")
+
+    internal = subparsers.add_parser("__run-profile")
+    internal.add_argument("--repo", required=True)
+    internal.add_argument("--run-id", required=True)
+    internal.add_argument("--profile", required=True)
+    internal.add_argument("--source-uri", required=True)
+    internal.add_argument("--config", required=True)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.verb == "__run-profile":
+        return internal_run_profile(args)
+
+    if args.verb not in PUBLIC_VERBS:
+        raise AgentError("UNKNOWN_VERB", f"Unknown verb: {args.verb}", 22, {"verb": args.verb})
+
+    started_at = time.time()
+    request_id = make_request_id()
+    agent_home = Path(os.environ.get("OPENCLAW_MAC_AGENT_HOME", DEFAULT_AGENT_HOME)).expanduser()
+
+    try:
+        config = load_config(args.config)
+        repo_info = parse_repo(config, args.repo)
+        data = HANDLERS[args.verb](args, config, repo_info)
+        payload = response_envelope(
+            ok=True,
+            verb=args.verb,
+            request_id=request_id,
+            exit_code=0,
+            started_at=started_at,
+            data=data,
+        )
+        emit_json(payload)
+        audit_log(agent_home, {
+            "ts": utc_now(),
+            "request_id": request_id,
+            "caller": os.environ.get("SSH_CONNECTION", "local"),
+            "verb": args.verb,
+            "repo": args.repo,
+            "exit_code": 0,
+            "duration_ms": payload["duration_ms"],
+            "timed_out": False,
+        })
+        return 0
+    except AgentError as exc:
+        payload = response_envelope(
+            ok=False,
+            verb=getattr(args, "verb", "unknown"),
+            request_id=request_id,
+            exit_code=exc.exit_code,
+            started_at=started_at,
+            data=None,
+            error={"code": exc.code, "message": exc.message, "details": exc.details},
+        )
+        emit_json(payload)
+        audit_log(agent_home, {
+            "ts": utc_now(),
+            "request_id": request_id,
+            "caller": os.environ.get("SSH_CONNECTION", "local"),
+            "verb": getattr(args, "verb", "unknown"),
+            "repo": getattr(args, "repo", None),
+            "exit_code": exc.exit_code,
+            "duration_ms": payload["duration_ms"],
+            "timed_out": exc.code == "TIMEOUT",
+            "error": {"code": exc.code, "message": exc.message},
+        })
+        return exc.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

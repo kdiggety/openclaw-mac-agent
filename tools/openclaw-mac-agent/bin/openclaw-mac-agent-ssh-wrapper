@@ -1,0 +1,54 @@
+#!/bin/bash
+set -euo pipefail
+
+BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+AGENT_BIN="${BASE_DIR}/bin/openclaw-mac-agent"
+LOG_FILE="${OPENCLAW_MAC_AGENT_HOME:-$HOME/.openclaw-mac-agent}/logs/ssh-wrapper.log"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+
+reject() {
+  printf '%s wrapper_reject remote=%s command=%s reason=%s\n' \
+    "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    "${SSH_CONNECTION:-unknown}" \
+    "${SSH_ORIGINAL_COMMAND:-}" \
+    "$1" >>"$LOG_FILE"
+  printf 'openclaw-mac-agent-ssh-wrapper: %s\n' "$1" >&2
+  exit 126
+}
+
+ORIGINAL="${SSH_ORIGINAL_COMMAND:-}"
+[[ -n "$ORIGINAL" ]] || reject "empty SSH command"
+
+set +e
+TOKENS=()
+while IFS= read -r -d '' item; do
+  TOKENS+=("$item")
+done < <(python3 - <<'PY' "$ORIGINAL"
+import shlex
+import sys
+
+command = sys.argv[1]
+try:
+    parts = shlex.split(command)
+except ValueError:
+    sys.exit(2)
+
+for part in parts:
+    sys.stdout.write(part)
+    sys.stdout.write("\0")
+PY
+)
+STATUS=$?
+set -e
+
+[[ $STATUS -eq 0 ]] || reject "unable to parse SSH_ORIGINAL_COMMAND"
+[[ ${#TOKENS[@]} -ge 1 ]] || reject "empty SSH command"
+[[ "${TOKENS[0]}" == "openclaw-mac-agent" ]] || reject "command must start with openclaw-mac-agent"
+
+printf '%s wrapper_exec remote=%s command=%s\n' \
+  "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+  "${SSH_CONNECTION:-unknown}" \
+  "$ORIGINAL" >>"$LOG_FILE"
+
+exec "$AGENT_BIN" "${TOKENS[@]:1}"

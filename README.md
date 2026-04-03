@@ -1,6 +1,11 @@
-# mac_worker
+# openclaw-mac-agent
 
-`mac_worker` is a thin macOS-side build, test, and validation worker for Apple-specific tasks. It is meant to be called locally on a real Mac or remotely over SSH by a Linux-hosted orchestrator such as OpenClaw.
+This repo now contains two complementary macOS-side command surfaces for OpenClaw:
+
+- `openclaw-mac-agent`: a shell-free, JSON-speaking repo/debug agent for bounded inspection and pipeline-style tasks
+- `mac_worker`: a narrower Apple build, test, simulator, launch, screenshot, and log-collection worker
+
+Both are intended to be called locally on a real Mac or remotely over SSH by a Linux-hosted orchestrator such as OpenClaw.
 
 It is not:
 
@@ -13,10 +18,38 @@ It is not:
 
 ## Status
 
-- Shell `v1` is the primary implementation: [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/mac-worker/bin/mac_worker`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/mac-worker/bin/mac_worker)
-- Swift CLI is still a scaffold that tracks the same command surface: [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/mac-worker/Sources/mac_worker`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/mac-worker/Sources/mac_worker)
+- `openclaw-mac-agent` shell-free CLI: [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/openclaw-mac-agent/bin/openclaw-mac-agent`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/openclaw-mac-agent/bin/openclaw-mac-agent)
+- `mac_worker` shell `v1`: [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/mac-worker/bin/mac_worker`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/mac-worker/bin/mac_worker)
+- Swift `mac_worker` CLI is still a scaffold that tracks the same command surface: [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/mac-worker/Sources/mac_worker`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/mac-worker/Sources/mac_worker)
 
-## Command Surface
+## openclaw-mac-agent Command Surface
+
+The broader OpenClaw-facing contract currently supports:
+
+- `env-check`
+- `repo-status`
+- `read-file`
+- `tail-file`
+- `list-artifacts`
+- `summarize-artifact`
+- `validate-analyzer`
+- `run-pipeline`
+- `get-run-status`
+- `git-fetch`
+- `git-pull --ff-only`
+
+Design constraints:
+
+- JSON-only responses
+- logical repo names mapped to fixed absolute paths
+- named roots with relative-path-only access
+- fixed internal recipes and profiles for write/execute verbs
+- no generic shell access
+- no persistent interactive sessions
+
+See [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/openclaw-mac-agent/README.md`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/openclaw-mac-agent/README.md) for details.
+
+## mac_worker Command Surface
 
 The supported `v1` commands are:
 
@@ -41,6 +74,14 @@ The supported `v1` commands are:
 │  ├─ run-remote-build.sh
 │  └─ collect-mac-artifacts.sh
 └─ tools/
+   ├─ openclaw-mac-agent/
+   │  ├─ README.md
+   │  ├─ bin/
+   │  │  ├─ openclaw-mac-agent
+   │  │  └─ openclaw-mac-agent-ssh-wrapper
+   │  └─ config/
+   │     ├─ repos.example.json
+   │     └─ masterofdrums-pipeline.example.json
    └─ mac-worker/
       ├─ README.md
       ├─ bin/
@@ -171,6 +212,20 @@ By default this wrapper:
 
 The wrapper reports `jobId` values and remote artifact paths in JSON. Direct `rsync`/artifact copying is not attempted by default because the recommended SSH key is intentionally restricted to `mac_worker` commands by the forced-command gate.
 
+For broader repo inspection and bounded pipeline debugging over SSH, use `openclaw-mac-agent` with its own forced-command wrapper instead of overloading `mac_worker`.
+
+For a simple Linux-side smoke test of that path, use:
+
+```bash
+bash ./scripts/test-openclaw-mac-agent-remote.sh
+```
+
+For Mac-side setup of the `openclaw-mac-agent` config and SSH wrapper path, use:
+
+```bash
+bash ./scripts/install-openclaw-mac-agent-config.sh openclaw-agent
+```
+
 ## Artifacts And Logs
 
 All worker-owned output goes under the macOS worker user's home directory:
@@ -181,7 +236,7 @@ All worker-owned output goes under the macOS worker user's home directory:
 
 ## Security Guidance
 
-Use the worker behind an SSH forced-command boundary rather than giving automation a full shell. See [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/docs/security.md`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/docs/security.md).
+Use both command surfaces behind SSH forced-command boundaries rather than giving automation a full shell. See [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/docs/security.md`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/docs/security.md).
 
 ## v1 Limitations
 
@@ -193,6 +248,7 @@ Use the worker behind an SSH forced-command boundary rather than giving automati
 
 ## Next Reads
 
+- `openclaw-mac-agent` contract: [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/openclaw-mac-agent/README.md`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/openclaw-mac-agent/README.md)
 - Worker-specific details: [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/mac-worker/README.md`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/tools/mac-worker/README.md)
 - Security and SSH gate setup: [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/docs/security.md`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/docs/security.md)
 - Architecture overview: [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/docs/architecture.md`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/docs/architecture.md)

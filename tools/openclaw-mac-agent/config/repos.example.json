@@ -1,0 +1,44 @@
+{
+  "repos": {
+    "masterofdrums-pipeline": {
+      "path": "/Users/openclaw-agent/workspace/masterofdrums-pipeline",
+      "roots": {
+        "logs": "{repo}/logs",
+        "artifacts": "{repo}/output",
+        "tmp": "{repo}/tmp",
+        "runs": "{repo}/runs"
+      },
+      "recipes": {
+        "validate-analyzer": {
+          "argv": [
+            "{repo}/.venv/bin/python",
+            "{repo}/scripts/analyzer-wrapper.py",
+            "--input",
+            "{source_path}",
+            "--output",
+            "{root_tmp}/validate-analyzer-output.json"
+          ],
+          "timeout_seconds": 60
+        }
+      },
+      "pipeline_profiles": {
+        "debug": {
+          "argv": [
+            "{repo}/.venv/bin/python",
+            "{repo}/scripts/run_pipeline.py",
+            "--source-uri",
+            "{source_uri}"
+          ],
+          "timeout_seconds": 600
+        }
+      }
+    }
+  },
+  "roots": {
+    "repo": "{repo}",
+    "logs": "{repo}/logs",
+    "artifacts": "{repo}/output",
+    "tmp": "{repo}/tmp",
+    "runs": "{repo}/runs"
+  }
+}
