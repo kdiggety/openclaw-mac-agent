@@ -108,7 +108,12 @@ PY
 run_remote_json() {
   local verb="$1"
   shift
-  ssh -i "$MAC_SSH_KEY" "$MAC_HOST" "openclaw-mac-agent $verb --repo $MAC_AGENT_REPO --json $*"
+  local remote_cmd="openclaw-mac-agent $(printf '%q' "$verb") --repo $(printf '%q' "$MAC_AGENT_REPO") --json"
+  local arg
+  for arg in "$@"; do
+    remote_cmd+=" $(printf '%q' "$arg")"
+  done
+  ssh -i "$MAC_SSH_KEY" "$MAC_HOST" "$remote_cmd"
 }
 
 run_remote_json_capture() {
