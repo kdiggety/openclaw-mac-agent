@@ -10,14 +10,19 @@ TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/openclaw-mac-agent-test.XXXXXX")"
 trap 'rm -rf "${TEST_ROOT}"' EXIT
 
 FAKE_REPO="${TEST_ROOT}/masterofdrums-pipeline"
+FAKE_APP_REPO="${TEST_ROOT}/masterofdrums"
+FAKE_APP_REMOTE="${TEST_ROOT}/masterofdrums-origin.git"
 FAKE_CONFIG="${TEST_ROOT}/repos.json"
 FAKE_AGENT_HOME="${TEST_ROOT}/agent-home"
 
 mkdir -p "${FAKE_REPO}/logs" "${FAKE_REPO}/output/latest" "${FAKE_REPO}/tmp" "${FAKE_REPO}/runs" "${FAKE_REPO}/scripts"
+mkdir -p "${FAKE_APP_REPO}/fixtures" "${FAKE_APP_REPO}/tmp" "${FAKE_APP_REPO}/runs" "${FAKE_APP_REPO}/scripts"
 printf 'line1\nline2\nline3\n' > "${FAKE_REPO}/logs/pipeline.log"
 printf '{"meta":{"name":"demo"},"events":[1,2,3],"tempo_map":[120]}\n' > "${FAKE_REPO}/output/latest/base-chart.json"
 printf 'hello world\n' > "${FAKE_REPO}/README.txt"
 printf 'fake' > "${FAKE_REPO}/tmp/input.wav"
+printf '{"timingContractVersion":"0.1.0","timing":{"bpm":120.0,"offsetSeconds":0.0,"ticksPerBeat":480,"timeSignature":{"numerator":4,"denominator":4},"source":"generated"}}\n' > "${FAKE_APP_REPO}/fixtures/chart.json"
+printf 'audio' > "${FAKE_APP_REPO}/fixtures/song.mp3"
 
 cat > "${FAKE_REPO}/scripts/validate_analyzer.py" <<'EOF'
 #!/usr/bin/env python3
@@ -53,12 +58,75 @@ EOF
 
 chmod +x "${FAKE_REPO}/scripts/validate_analyzer.py" "${FAKE_REPO}/scripts/run_pipeline.py"
 
+cat > "${FAKE_APP_REPO}/scripts/build_app.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+echo "build ok"
+EOF
+
+cat > "${FAKE_APP_REPO}/scripts/validate_chart.py" <<'EOF'
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--chart", required=True)
+parser.add_argument("--mode", required=True)
+parser.add_argument("--audio", default="")
+parser.add_argument("--expected-bpm", default="")
+parser.add_argument("--expected-offset-seconds", default="")
+parser.add_argument("--expected-ticks-per-beat", default="")
+parser.add_argument("--expected-time-signature", default="")
+parser.add_argument("--expected-timing-source", default="")
+args = parser.parse_args()
+
+payload = json.loads(Path(args.chart).read_text())
+result = {
+    "timingContractVersion": payload["timingContractVersion"],
+    "timing": payload["timing"],
+    "authorityChecks": {
+        "generatedTimingAuthoritative": True,
+        "audioDetectionDiagnosticOnly": True,
+        "manualOverrideExplicit": args.mode in {"manual-override", "full"},
+        "timeSignatureRespected": True,
+    },
+    "uiObservations": [
+        "Timing source displayed as Chart Timing v0.1.0",
+        "Audio BPM shown as diagnostic only",
+    ],
+    "artifacts": {
+        "screenshots": [],
+        "logs": [],
+        "xcresult": None,
+    },
+}
+print(json.dumps(result))
+EOF
+
+chmod +x "${FAKE_APP_REPO}/scripts/build_app.sh" "${FAKE_APP_REPO}/scripts/validate_chart.py"
+
 cd "${FAKE_REPO}"
 git init >/dev/null
 git config user.email "test@example.com"
 git config user.name "Test User"
 git add .
 git commit -m "Initial fake repo" >/dev/null
+
+cd "${FAKE_APP_REPO}"
+git init >/dev/null
+git config user.email "test@example.com"
+git config user.name "Test User"
+git add .
+git commit -m "Initial fake app repo" >/dev/null
+git init --bare "${FAKE_APP_REMOTE}" >/dev/null
+git remote add origin "${FAKE_APP_REMOTE}"
+APP_BRANCH="$(git branch --show-current)"
+git push -u origin "${APP_BRANCH}" >/dev/null
+cat >> "${FAKE_APP_REPO}/.git/info/exclude" <<'EOF'
+tmp/
+runs/
+EOF
 
 cat > "${FAKE_CONFIG}" <<EOF
 {
@@ -94,6 +162,45 @@ cat > "${FAKE_CONFIG}" <<EOF
             "{source_path}",
             "--output",
             "{root_tmp}/validated.json"
+          ],
+          "timeout_seconds": 30
+        }
+      }
+    },
+    "masterofdrums": {
+      "path": "${FAKE_APP_REPO}",
+      "roots": {
+        "fixtures": "{repo}/fixtures",
+        "tmp": "{repo}/tmp",
+        "runs": "{repo}/runs"
+      },
+      "app_validation": {
+        "build_recipe": {
+          "argv": [
+            "{repo}/scripts/build_app.sh"
+          ],
+          "timeout_seconds": 30
+        },
+        "import_recipe": {
+          "argv": [
+            "/usr/bin/python3",
+            "{repo}/scripts/validate_chart.py",
+            "--chart",
+            "{chart_resolved_path}",
+            "--mode",
+            "{validation_mode}",
+            "--audio",
+            "{audio_resolved_path}",
+            "--expected-bpm",
+            "{expected_bpm}",
+            "--expected-offset-seconds",
+            "{expected_offset_seconds}",
+            "--expected-ticks-per-beat",
+            "{expected_ticks_per_beat}",
+            "--expected-time-signature",
+            "{expected_time_signature}",
+            "--expected-timing-source",
+            "{expected_timing_source}"
           ],
           "timeout_seconds": 30
         }
@@ -204,5 +311,12 @@ TRAVERSAL_JSON="$(run_json_allow_fail read-file --repo masterofdrums-pipeline --
 printf 'Phase 11: SSH wrapper dispatch\n'
 WRAPPER_JSON="$(OPENCLAW_MAC_AGENT_CONFIG="${FAKE_CONFIG}" OPENCLAW_MAC_AGENT_HOME="${FAKE_AGENT_HOME}" SSH_ORIGINAL_COMMAND='openclaw-mac-agent env-check --repo masterofdrums-pipeline --json' "${SSH_WRAPPER}")"
 [[ "$(json_field "$WRAPPER_JSON" "ok")" == "True" || "$(json_field "$WRAPPER_JSON" "ok")" == "true" ]]
+
+printf 'Phase 12: validate-masterofdrums-chart\n'
+APP_HEAD="$(git -C "${FAKE_APP_REPO}" rev-parse HEAD)"
+APP_VALIDATE_JSON="$(run_json validate-masterofdrums-chart --repo masterofdrums --branch "${APP_BRANCH}" --expected-commit "${APP_HEAD}" --chart-root fixtures --chart-path chart.json --audio-root fixtures --audio-path song.mp3 --validation-mode full --expected-bpm 120 --expected-offset-seconds 0 --expected-ticks-per-beat 480 --expected-time-signature 4/4 --expected-timing-source generated --json)"
+[[ "$(json_field "$APP_VALIDATE_JSON" "ok")" == "True" || "$(json_field "$APP_VALIDATE_JSON" "ok")" == "true" ]]
+[[ "$(json_field "$APP_VALIDATE_JSON" "data.status")" == "pass" ]]
+[[ "$(json_field "$APP_VALIDATE_JSON" "data.import.timing.source")" == "generated" ]]
 
 printf '\nAll openclaw-mac-agent smoke phases passed.\n'

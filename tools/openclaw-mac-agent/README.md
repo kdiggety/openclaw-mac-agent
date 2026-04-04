@@ -20,6 +20,7 @@
 - `list-artifacts`
 - `summarize-artifact`
 - `validate-analyzer`
+- `validate-masterofdrums-chart`
 - `run-pipeline`
 - `get-run-status`
 - `git-fetch`
@@ -48,6 +49,14 @@ config/masterofdrums-pipeline.example.json
 ```
 
 and adapt the `validate-analyzer` and `pipeline_profiles.debug` recipes to match the real repo scripts that should be exposed remotely.
+
+For app-level `masterofdrums` validation, add a separate repo entry with `app_validation.build_recipe` and `app_validation.import_recipe`. The new `validate-masterofdrums-chart` verb will:
+
+- `git-sync` the repo to an exact branch and commit
+- resolve chart/audio paths against named roots
+- run the configured build recipe
+- run the configured chart-import/timing validation recipe
+- return structured JSON for build/import/authority-check results
 
 The checked-in `masterofdrums-pipeline` example now targets the real app flow:
 

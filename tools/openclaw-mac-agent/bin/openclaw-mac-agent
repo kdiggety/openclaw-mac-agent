@@ -35,6 +35,7 @@ PUBLIC_VERBS = {
     "list-artifacts",
     "summarize-artifact",
     "validate-analyzer",
+    "validate-masterofdrums-chart",
     "run-pipeline",
     "get-run-status",
     "git-fetch",
@@ -52,6 +53,13 @@ TEXT_EXTENSIONS = {
     ".swift",
     ".py",
     ".sh",
+}
+MASTEROFDRUMS_VALIDATION_MODES = {
+    "build-only",
+    "import-timing",
+    "manual-override",
+    "mismatch-diagnostic",
+    "full",
 }
 
 
@@ -390,6 +398,22 @@ def validate_branch_name(branch: str) -> None:
 def validate_commit_sha(commit: str) -> None:
     if not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit):
         raise AgentError("INVALID_COMMIT", f"Invalid commit SHA: {commit}", 22, {"expected_commit": commit})
+
+
+def validate_validation_mode(mode: str) -> None:
+    if mode not in MASTEROFDRUMS_VALIDATION_MODES:
+        raise AgentError("INVALID_VALIDATION_MODE", f"Invalid validation mode: {mode}", 22, {"validation_mode": mode})
+
+
+def parse_time_signature(value: str) -> Dict[str, int]:
+    match = re.fullmatch(r"(\d{1,3})/(\d{1,3})", value)
+    if not match:
+        raise AgentError("INVALID_TIME_SIGNATURE", f"Invalid time signature: {value}", 22, {"expected_time_signature": value})
+    numerator = int(match.group(1))
+    denominator = int(match.group(2))
+    if numerator <= 0 or denominator <= 0:
+        raise AgentError("INVALID_TIME_SIGNATURE", f"Invalid time signature: {value}", 22, {"expected_time_signature": value})
+    return {"numerator": numerator, "denominator": denominator}
 
 
 def parse_summary_artifacts(run_dir: Path) -> List[Dict[str, Any]]:
@@ -817,6 +841,232 @@ def handler_validate_analyzer(args: argparse.Namespace, config: Dict[str, Any], 
     }
 
 
+def run_git_sync(repo_info: Dict[str, Any], branch: str, expected_commit: str) -> Dict[str, Any]:
+    validate_branch_name(branch)
+    validate_commit_sha(expected_commit)
+    ensure_clean_tree(repo_info)
+
+    fetch_result = run_subprocess(["git", "fetch", "--prune", "origin"], repo_info=repo_info, timeout=60)
+    remote_ref = f"refs/remotes/origin/{branch}"
+    ref_check = run_subprocess(["git", "show-ref", "--verify", remote_ref], repo_info=repo_info, timeout=10)
+    if ref_check["status"] != 0:
+        raise AgentError("REMOTE_BRANCH_NOT_FOUND", f"Remote branch not found: origin/{branch}", 22, {"branch": branch})
+
+    commit_check = run_subprocess(["git", "rev-parse", "--verify", f"{expected_commit}^{{commit}}"], repo_info=repo_info, timeout=10)
+    if commit_check["status"] != 0:
+        raise AgentError("COMMIT_NOT_FOUND", f"Commit not found: {expected_commit}", 22, {"expected_commit": expected_commit})
+    resolved_commit = commit_check["stdout"].strip()
+
+    ancestry = run_subprocess(["git", "merge-base", "--is-ancestor", resolved_commit, remote_ref], repo_info=repo_info, timeout=10)
+    if ancestry["status"] != 0:
+        raise AgentError(
+            "COMMIT_NOT_ON_BRANCH",
+            f"Commit {resolved_commit} is not reachable from origin/{branch}",
+            22,
+            {"branch": branch, "expected_commit": resolved_commit},
+        )
+
+    checkout = run_subprocess(["git", "checkout", "--detach", resolved_commit], repo_info=repo_info, timeout=30)
+    final_head = git_head(repo_info)
+    return {
+        "operation": "sync",
+        "branch": branch,
+        "expected_commit": expected_commit,
+        "resolved_commit": resolved_commit,
+        "head": final_head,
+        "exit_code": checkout["status"],
+        "stdout": "\n".join(part for part in [fetch_result["stdout"], checkout["stdout"]] if part).strip(),
+        "stderr": "\n".join(part for part in [fetch_result["stderr"], checkout["stderr"]] if part).strip(),
+    }
+
+
+def parse_json_if_possible(text: str) -> Optional[Any]:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+
+def build_masterofdrums_template_vars(
+    repo_info: Dict[str, Any],
+    *,
+    chart_root: str,
+    chart_path: str,
+    chart_resolved_path: Path,
+    audio_root: Optional[str],
+    audio_path: Optional[str],
+    audio_resolved_path: Optional[Path],
+    validation_mode: str,
+    expectations: Dict[str, Any],
+) -> Dict[str, str]:
+    template_vars = {
+        "chart_root": chart_root,
+        "chart_path": chart_path,
+        "chart_resolved_path": str(chart_resolved_path),
+        "validation_mode": validation_mode,
+        "expected_bpm": "" if expectations.get("bpm") is None else str(expectations["bpm"]),
+        "expected_offset_seconds": "" if expectations.get("offsetSeconds") is None else str(expectations["offsetSeconds"]),
+        "expected_ticks_per_beat": "" if expectations.get("ticksPerBeat") is None else str(expectations["ticksPerBeat"]),
+        "expected_time_signature": "",
+        "expected_time_signature_numerator": "",
+        "expected_time_signature_denominator": "",
+        "expected_timing_source": expectations.get("timingSource") or "",
+        "audio_root": audio_root or "",
+        "audio_path": audio_path or "",
+        "audio_resolved_path": str(audio_resolved_path) if audio_resolved_path else "",
+    }
+    time_signature = expectations.get("timeSignature")
+    if time_signature:
+        template_vars["expected_time_signature"] = f'{time_signature["numerator"]}/{time_signature["denominator"]}'
+        template_vars["expected_time_signature_numerator"] = str(time_signature["numerator"])
+        template_vars["expected_time_signature_denominator"] = str(time_signature["denominator"])
+    return template_vars
+
+
+def evaluate_expected_timing(import_payload: Dict[str, Any], expectations: Dict[str, Any]) -> List[Dict[str, Any]]:
+    timing = import_payload.get("timing") or {}
+    mismatches: List[Dict[str, Any]] = []
+    for key, expected_key in (("bpm", "bpm"), ("offsetSeconds", "offsetSeconds"), ("ticksPerBeat", "ticksPerBeat")):
+        if expectations.get(expected_key) is None:
+            continue
+        actual = timing.get(key)
+        if actual != expectations[expected_key]:
+            mismatches.append({"field": key, "expected": expectations[expected_key], "actual": actual})
+    if expectations.get("timeSignature") is not None:
+        actual_sig = timing.get("timeSignature") or {}
+        if actual_sig != expectations["timeSignature"]:
+            mismatches.append({"field": "timeSignature", "expected": expectations["timeSignature"], "actual": actual_sig})
+    if expectations.get("timingSource") is not None:
+        actual_source = timing.get("source")
+        if actual_source != expectations["timingSource"]:
+            mismatches.append({"field": "source", "expected": expectations["timingSource"], "actual": actual_source})
+    return mismatches
+
+
+def handler_validate_masterofdrums_chart(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    validate_validation_mode(args.validation_mode)
+    chart_resolved_path = resolve_repo_path(repo_info, args.chart_root, args.chart_path, must_exist=True)
+    if not chart_resolved_path.is_file():
+        raise AgentError("CHART_NOT_A_FILE", f"Chart path is not a file: {chart_resolved_path}", 22, {"chart_path": args.chart_path})
+
+    audio_resolved_path: Optional[Path] = None
+    if args.audio_path:
+        audio_root = args.audio_root or "repo"
+        audio_resolved_path = resolve_repo_path(repo_info, audio_root, args.audio_path, must_exist=True)
+        if not audio_resolved_path.is_file():
+            raise AgentError("AUDIO_NOT_A_FILE", f"Audio path is not a file: {audio_resolved_path}", 22, {"audio_path": args.audio_path})
+    elif args.audio_root:
+        raise AgentError("AUDIO_PATH_REQUIRED", "--audio-root requires --audio-path", 22)
+
+    expectations = {
+        "bpm": args.expected_bpm,
+        "offsetSeconds": args.expected_offset_seconds,
+        "ticksPerBeat": args.expected_ticks_per_beat,
+        "timeSignature": parse_time_signature(args.expected_time_signature) if args.expected_time_signature else None,
+        "timingSource": args.expected_timing_source,
+    }
+
+    validation_cfg = (repo_info["config"].get("app_validation") or {})
+    build_recipe = validation_cfg.get("build_recipe")
+    import_recipe = validation_cfg.get("import_recipe")
+    if not build_recipe:
+        raise AgentError("APP_VALIDATION_NOT_CONFIGURED", "masterofdrums app validation build recipe is not configured", 22, {"repo": repo_info["name"]})
+    if args.validation_mode != "build-only" and not import_recipe:
+        raise AgentError("APP_VALIDATION_NOT_CONFIGURED", "masterofdrums app validation import recipe is not configured", 22, {"repo": repo_info["name"]})
+
+    sync = run_git_sync(repo_info, args.branch, args.expected_commit)
+    template_vars = build_masterofdrums_template_vars(
+        repo_info,
+        chart_root=args.chart_root,
+        chart_path=args.chart_path,
+        chart_resolved_path=chart_resolved_path,
+        audio_root=args.audio_root,
+        audio_path=args.audio_path,
+        audio_resolved_path=audio_resolved_path,
+        validation_mode=args.validation_mode,
+        expectations=expectations,
+    )
+
+    build_argv = render_template_list(build_recipe["argv"], repo_info, template_vars)
+    build_env = render_template_map(build_recipe.get("env") or {}, repo_info, template_vars)
+    build_timeout = int(build_recipe.get("timeout_seconds", 600))
+    build_result = run_subprocess(build_argv, repo_info=repo_info, timeout=build_timeout, extra_env=build_env)
+    build_payload = {
+        "status": "pass" if build_result["status"] == 0 else "fail",
+        "details": build_result["stdout"] or build_result["stderr"],
+        "stdout": build_result["stdout"],
+        "stderr": build_result["stderr"],
+    }
+    if build_result["status"] != 0:
+        raise AgentError("BUILD_FAILED", "masterofdrums build failed", build_result["status"], {"build": build_payload})
+
+    import_payload: Dict[str, Any] = {
+        "status": "skipped",
+        "chart": {"root": args.chart_root, "path": args.chart_path, "resolved_path": str(chart_resolved_path)},
+        "audio": None if not audio_resolved_path else {"root": args.audio_root or "repo", "path": args.audio_path, "resolved_path": str(audio_resolved_path)},
+        "timingContractVersion": None,
+        "timing": {},
+        "stdout": "",
+        "stderr": "",
+    }
+    authority_checks = {
+        "generatedTimingAuthoritative": None,
+        "audioDetectionDiagnosticOnly": None,
+        "manualOverrideExplicit": None,
+        "timeSignatureRespected": None,
+    }
+    ui_observations: List[str] = []
+    artifacts = {"screenshots": [], "logs": [], "xcresult": None}
+    errors: List[Dict[str, Any]] = []
+
+    if args.validation_mode != "build-only":
+        import_argv = render_template_list(import_recipe["argv"], repo_info, template_vars)
+        import_env = render_template_map(import_recipe.get("env") or {}, repo_info, template_vars)
+        import_timeout = int(import_recipe.get("timeout_seconds", 300))
+        import_result = run_subprocess(import_argv, repo_info=repo_info, timeout=import_timeout, extra_env=import_env)
+        import_payload["status"] = "pass" if import_result["status"] == 0 else "fail"
+        import_payload["stdout"] = import_result["stdout"]
+        import_payload["stderr"] = import_result["stderr"]
+        parsed_import = parse_json_if_possible(import_result["stdout"])
+        if isinstance(parsed_import, dict):
+            import_payload["timingContractVersion"] = parsed_import.get("timingContractVersion")
+            import_payload["timing"] = parsed_import.get("timing") or {}
+            authority_checks.update(parsed_import.get("authorityChecks") or {})
+            ui_observations = parsed_import.get("uiObservations") or []
+            parsed_artifacts = parsed_import.get("artifacts") or {}
+            if isinstance(parsed_artifacts, dict):
+                artifacts.update(parsed_artifacts)
+        if import_result["status"] != 0:
+            raise AgentError("CHART_IMPORT_FAILED", "masterofdrums chart validation failed", import_result["status"], {"import": import_payload})
+
+        mismatches = evaluate_expected_timing(import_payload, expectations)
+        if mismatches:
+            errors.extend({"code": "EXPECTED_TIMING_MISMATCH", "details": item} for item in mismatches)
+
+    status = "pass"
+    if errors:
+        status = "fail"
+    elif args.validation_mode != "build-only" and import_payload["status"] != "pass":
+        status = "fail"
+
+    return {
+        "status": status,
+        "repo": repo_info["name"],
+        "validation_mode": args.validation_mode,
+        "sync": {key: sync[key] for key in ("branch", "expected_commit", "resolved_commit", "head")},
+        "build": build_payload,
+        "import": import_payload,
+        "expectations": expectations,
+        "authorityChecks": authority_checks,
+        "uiObservations": ui_observations,
+        "artifacts": artifacts,
+        "errors": errors,
+    }
+
+
 def run_dir_status_path(run_dir: Path) -> Path:
     return run_dir / "status.json"
 
@@ -1012,44 +1262,12 @@ def handler_git_pull(args: argparse.Namespace, config: Dict[str, Any], repo_info
 
 
 def handler_git_sync(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
-    validate_branch_name(args.branch)
-    validate_commit_sha(args.expected_commit)
-    ensure_clean_tree(repo_info)
-
-    fetch_result = run_subprocess(["git", "fetch", "--prune", "origin"], repo_info=repo_info, timeout=60)
-    remote_ref = f"refs/remotes/origin/{args.branch}"
-    ref_check = run_subprocess(["git", "show-ref", "--verify", remote_ref], repo_info=repo_info, timeout=10)
-    if ref_check["status"] != 0:
-        raise AgentError("REMOTE_BRANCH_NOT_FOUND", f"Remote branch not found: origin/{args.branch}", 22, {"branch": args.branch})
-
-    commit_check = run_subprocess(["git", "rev-parse", "--verify", f"{args.expected_commit}^{{commit}}"], repo_info=repo_info, timeout=10)
-    if commit_check["status"] != 0:
-        raise AgentError("COMMIT_NOT_FOUND", f"Commit not found: {args.expected_commit}", 22, {"expected_commit": args.expected_commit})
-    resolved_commit = commit_check["stdout"].strip()
-
-    ancestry = run_subprocess(["git", "merge-base", "--is-ancestor", resolved_commit, remote_ref], repo_info=repo_info, timeout=10)
-    if ancestry["status"] != 0:
-        raise AgentError(
-            "COMMIT_NOT_ON_BRANCH",
-            f"Commit {resolved_commit} is not reachable from origin/{args.branch}",
-            22,
-            {"branch": args.branch, "expected_commit": resolved_commit},
-        )
-
-    checkout = run_subprocess(["git", "checkout", "--detach", resolved_commit], repo_info=repo_info, timeout=30)
-    final_head = git_head(repo_info)
+    sync = run_git_sync(repo_info, args.branch, args.expected_commit)
     return {
         "repo": repo_info["name"],
-        "git": {
-            "operation": "sync",
-            "branch": args.branch,
-            "expected_commit": args.expected_commit,
-            "resolved_commit": resolved_commit,
-            "head": final_head,
-            "exit_code": checkout["status"],
-        },
-        "stdout": "\n".join(part for part in [fetch_result["stdout"], checkout["stdout"]] if part).strip(),
-        "stderr": "\n".join(part for part in [fetch_result["stderr"], checkout["stderr"]] if part).strip(),
+        "git": {key: sync[key] for key in ("operation", "branch", "expected_commit", "resolved_commit", "head", "exit_code")},
+        "stdout": sync["stdout"],
+        "stderr": sync["stderr"],
     }
 
 
@@ -1062,6 +1280,7 @@ HANDLERS = {
     "list-artifacts": handler_list_artifacts,
     "summarize-artifact": handler_summarize_artifact,
     "validate-analyzer": handler_validate_analyzer,
+    "validate-masterofdrums-chart": handler_validate_masterofdrums_chart,
     "run-pipeline": handler_run_pipeline,
     "get-run-status": handler_get_run_status,
     "git-fetch": handler_git_fetch,
@@ -1124,6 +1343,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser_validate.add_argument("--source-name")
     parser_validate.add_argument("--sample-set")
     parser_validate.add_argument("--json", action="store_true")
+
+    parser_master = subparsers.add_parser("validate-masterofdrums-chart")
+    parser_master.add_argument("--repo", required=True)
+    parser_master.add_argument("--branch", required=True)
+    parser_master.add_argument("--expected-commit", required=True)
+    parser_master.add_argument("--chart-root", required=True)
+    parser_master.add_argument("--chart-path", required=True)
+    parser_master.add_argument("--validation-mode", required=True)
+    parser_master.add_argument("--audio-root")
+    parser_master.add_argument("--audio-path")
+    parser_master.add_argument("--expected-bpm", type=float)
+    parser_master.add_argument("--expected-offset-seconds", type=float)
+    parser_master.add_argument("--expected-ticks-per-beat", type=int)
+    parser_master.add_argument("--expected-time-signature")
+    parser_master.add_argument("--expected-timing-source")
+    parser_master.add_argument("--json", action="store_true")
 
     parser_run = subparsers.add_parser("run-pipeline")
     parser_run.add_argument("--repo", required=True)

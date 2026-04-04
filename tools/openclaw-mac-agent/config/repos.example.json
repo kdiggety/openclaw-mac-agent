@@ -78,6 +78,54 @@
           "timeout_seconds": 600
         }
       }
+    },
+    "masterofdrums": {
+      "path": "/Users/openclaw-agent/workspace/masterofdrums",
+      "roots": {
+        "fixtures": "{repo}/Fixtures",
+        "artifacts": "{repo}/output",
+        "tmp": "{repo}/tmp",
+        "runs": "{repo}/runs",
+        "screenshots": "{repo}/screenshots"
+      },
+      "app_validation": {
+        "build_recipe": {
+          "argv": [
+            "/usr/bin/xcrun",
+            "xcodebuild",
+            "-project",
+            "{repo}/MasterOfDrums.xcodeproj",
+            "-scheme",
+            "MasterOfDrums",
+            "-configuration",
+            "Debug",
+            "build"
+          ],
+          "timeout_seconds": 900
+        },
+        "import_recipe": {
+          "argv": [
+            "{repo}/scripts/validate-chart-import.sh",
+            "--chart",
+            "{chart_resolved_path}",
+            "--mode",
+            "{validation_mode}",
+            "--audio",
+            "{audio_resolved_path}",
+            "--expected-bpm",
+            "{expected_bpm}",
+            "--expected-offset-seconds",
+            "{expected_offset_seconds}",
+            "--expected-ticks-per-beat",
+            "{expected_ticks_per_beat}",
+            "--expected-time-signature",
+            "{expected_time_signature}",
+            "--expected-timing-source",
+            "{expected_timing_source}"
+          ],
+          "timeout_seconds": 600
+        }
+      }
     }
   },
   "roots": {

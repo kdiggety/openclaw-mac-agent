@@ -33,6 +33,7 @@ The broader OpenClaw-facing contract currently supports:
 - `list-artifacts`
 - `summarize-artifact`
 - `validate-analyzer`
+- `validate-masterofdrums-chart`
 - `run-pipeline`
 - `get-run-status`
 - `git-fetch`
