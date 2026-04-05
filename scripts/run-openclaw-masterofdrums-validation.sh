@@ -102,6 +102,17 @@ if (( SELECTOR_COUNT > 1 )); then
   exit 7
 fi
 
+printf 'wrapper-config: repo=%s host=%s profile=%s\n' "$MAC_AGENT_REPO" "$MAC_HOST" "$PIPELINE_PROFILE"
+if [[ -n "$SOURCE_URI" ]]; then
+  printf 'wrapper-config: source_uri=%s\n' "$SOURCE_URI"
+elif [[ -n "$SOURCE_NAME" ]]; then
+  printf 'wrapper-config: source_name=%s\n' "$SOURCE_NAME"
+elif [[ -n "$SAMPLE_SET" ]]; then
+  printf 'wrapper-config: sample_set=%s\n' "$SAMPLE_SET"
+else
+  printf 'wrapper-config: source_selector=profile-default\n'
+fi
+
 json_field() {
   local json_payload="$1"
   local field_path="$2"
