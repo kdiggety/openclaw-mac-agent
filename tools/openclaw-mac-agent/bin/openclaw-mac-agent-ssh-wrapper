@@ -4,6 +4,7 @@ set -euo pipefail
 BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 AGENT_BIN="${BASE_DIR}/bin/openclaw-mac-agent"
 LOG_FILE="${OPENCLAW_MAC_AGENT_HOME:-$HOME/.openclaw-mac-agent}/logs/ssh-wrapper.log"
+DEFAULT_EXTERNAL_CONFIG="${HOME}/.config/openclaw-mac-agent/repos.json"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -46,9 +47,14 @@ set -e
 [[ ${#TOKENS[@]} -ge 1 ]] || reject "empty SSH command"
 [[ "${TOKENS[0]}" == "openclaw-mac-agent" ]] || reject "command must start with openclaw-mac-agent"
 
-printf '%s wrapper_exec remote=%s command=%s\n' \
+if [[ -z "${OPENCLAW_MAC_AGENT_CONFIG:-}" && -f "$DEFAULT_EXTERNAL_CONFIG" ]]; then
+  export OPENCLAW_MAC_AGENT_CONFIG="$DEFAULT_EXTERNAL_CONFIG"
+fi
+
+printf '%s wrapper_exec remote=%s command=%s config=%s\n' \
   "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
   "${SSH_CONNECTION:-unknown}" \
-  "$ORIGINAL" >>"$LOG_FILE"
+  "$ORIGINAL" \
+  "${OPENCLAW_MAC_AGENT_CONFIG:-embedded-default}" >>"$LOG_FILE"
 
 exec "$AGENT_BIN" "${TOKENS[@]:1}"
