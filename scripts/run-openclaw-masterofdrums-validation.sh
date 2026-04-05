@@ -18,10 +18,13 @@ Required environment:
   TARGET_BRANCH              branch OpenClaw wants tested
   EXPECTED_COMMIT            exact commit SHA OpenClaw wants tested
 
+Required environment:
+  MAC_AGENT_REPO             explicit repo id to validate via openclaw-mac-agent
+                             valid options: masterofdrums-pipeline, masterofdrums
+
 Optional environment:
   MAC_HOST                   default: openclaw-agent@192.168.1.156
   MAC_SSH_KEY                default: ~/.ssh/openclaw_mac_agent
-  MAC_AGENT_REPO             default: masterofdrums-pipeline
   PIPELINE_PROFILE           default: debug
   SOURCE_URI                 explicit file:// URI for the audio input on the Mac
   SOURCE_NAME                logical Mac-side sample source name from repos.json
@@ -47,9 +50,11 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   exit 0
 fi
 
+VALID_MAC_AGENT_REPOS="masterofdrums-pipeline, masterofdrums"
+
 MAC_HOST="${MAC_HOST:-openclaw-agent@192.168.1.156}"
 MAC_SSH_KEY="${MAC_SSH_KEY:-$HOME/.ssh/openclaw_mac_agent}"
-MAC_AGENT_REPO="${MAC_AGENT_REPO:-masterofdrums-pipeline}"
+MAC_AGENT_REPO="${MAC_AGENT_REPO:-}"
 PIPELINE_PROFILE="${PIPELINE_PROFILE:-debug}"
 RUN_VALIDATE_ANALYZER="${RUN_VALIDATE_ANALYZER:-1}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-5}"
@@ -74,6 +79,19 @@ SAMPLE_SET="${SAMPLE_SET:-}"
   printf 'missing required EXPECTED_COMMIT\n' >&2
   exit 7
 }
+
+[[ -n "$MAC_AGENT_REPO" ]] || {
+  printf 'missing required MAC_AGENT_REPO\nvalid options: %s\n' "$VALID_MAC_AGENT_REPOS" >&2
+  exit 7
+}
+
+case "$MAC_AGENT_REPO" in
+  masterofdrums-pipeline|masterofdrums) ;;
+  *)
+    printf 'invalid MAC_AGENT_REPO: %s\nvalid options: %s\n' "$MAC_AGENT_REPO" "$VALID_MAC_AGENT_REPOS" >&2
+    exit 7
+    ;;
+esac
 
 SELECTOR_COUNT=0
 [[ -n "$SOURCE_URI" ]] && SELECTOR_COUNT=$((SELECTOR_COUNT + 1))
