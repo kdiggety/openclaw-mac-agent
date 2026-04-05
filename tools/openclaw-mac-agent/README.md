@@ -172,11 +172,24 @@ MAC_SSH_KEY=~/.ssh/openclaw_mac_agent \
 bash ./scripts/run-openclaw-masterofdrums-validation.sh
 ```
 
+For app-level `masterofdrums` validation, use:
+
+```bash
+TARGET_BRANCH=feature/chart-timing-contract \
+EXPECTED_COMMIT=<sha> \
+CHART_ROOT=fixtures \
+CHART_PATH=validation-fixture.modchart.json \
+MAC_SSH_KEY=~/.ssh/openclaw_mac_agent \
+bash ./scripts/run-openclaw-masterofdrums-app-validation.sh
+```
+
 This wrapper belongs in the agent repo rather than the pipeline repo because it owns:
 
 - SSH transport details
 - branch/commit sync semantics
 - polling and result collation
 - the final machine-readable validation payload
+
+The app wrapper uses the same SSH forced-command surface, but calls `validate-masterofdrums-chart` instead of the pipeline verbs.
 
 If `SOURCE_URI` and `SOURCE_NAME` are omitted, the wrapper now relies on the Mac-side profile default configured in `repos.json`.

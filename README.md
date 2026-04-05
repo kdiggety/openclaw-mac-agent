@@ -241,6 +241,17 @@ MAC_SSH_KEY=~/.ssh/openclaw_mac_agent \
 bash ./scripts/run-openclaw-masterofdrums-validation.sh
 ```
 
+For app-level `masterofdrums` validation, use:
+
+```bash
+TARGET_BRANCH=feature/chart-timing-contract \
+EXPECTED_COMMIT=<sha> \
+CHART_ROOT=fixtures \
+CHART_PATH=validation-fixture.modchart.json \
+MAC_SSH_KEY=~/.ssh/openclaw_mac_agent \
+bash ./scripts/run-openclaw-masterofdrums-app-validation.sh
+```
+
 If you want OpenClaw to select among Mac-defined fixtures without passing file paths, it can optionally add:
 
 ```bash
@@ -255,6 +266,13 @@ That wrapper:
 - runs the bounded debug pipeline profile
 - polls `get-run-status`
 - returns one final JSON document including the chart artifact URI when available
+
+The app-validation wrapper:
+
+- syncs the Mac app repo to an exact branch and commit
+- runs `env-check`
+- runs `validate-masterofdrums-chart`
+- returns one final JSON document including build/import/integration results
 
 By default, the Mac-side profile can now own the sample input via `default_sample_set`, `default_source_name`, or `default_source_uri` in `repos.json`. Linux/OpenClaw does not need to know any Mac file paths, and only needs to pass `SOURCE_URI`, `SOURCE_NAME`, or `SAMPLE_SET` when overriding that default. `SAMPLE_SET` is optional and is just a logical Mac-side name.
 
