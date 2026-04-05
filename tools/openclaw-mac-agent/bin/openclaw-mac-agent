@@ -946,6 +946,23 @@ def evaluate_expected_timing(import_payload: Dict[str, Any], expectations: Dict[
     return mismatches
 
 
+def normalize_build_recipes(validation_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    build_recipes = validation_cfg.get("build_recipes")
+    if build_recipes is not None:
+        if not isinstance(build_recipes, list) or not build_recipes:
+            raise AgentError("APP_VALIDATION_NOT_CONFIGURED", "masterofdrums app validation build_recipes must be a non-empty list", 22)
+        return build_recipes
+
+    build_recipe = validation_cfg.get("build_recipe")
+    if not build_recipe:
+        raise AgentError("APP_VALIDATION_NOT_CONFIGURED", "masterofdrums app validation build recipe is not configured", 22)
+    return [build_recipe]
+
+
+def should_run_integration_recipe(validation_mode: str) -> bool:
+    return validation_mode in {"manual-override", "mismatch-diagnostic", "full"}
+
+
 def handler_validate_masterofdrums_chart(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
     validate_validation_mode(args.validation_mode)
     chart_resolved_path = resolve_repo_path(repo_info, args.chart_root, args.chart_path, must_exist=True)
@@ -970,10 +987,9 @@ def handler_validate_masterofdrums_chart(args: argparse.Namespace, config: Dict[
     }
 
     validation_cfg = (repo_info["config"].get("app_validation") or {})
-    build_recipe = validation_cfg.get("build_recipe")
+    build_recipes = normalize_build_recipes(validation_cfg)
     import_recipe = validation_cfg.get("import_recipe")
-    if not build_recipe:
-        raise AgentError("APP_VALIDATION_NOT_CONFIGURED", "masterofdrums app validation build recipe is not configured", 22, {"repo": repo_info["name"]})
+    integration_recipe = validation_cfg.get("integration_recipe")
     if args.validation_mode != "build-only" and not import_recipe:
         raise AgentError("APP_VALIDATION_NOT_CONFIGURED", "masterofdrums app validation import recipe is not configured", 22, {"repo": repo_info["name"]})
 
@@ -990,18 +1006,37 @@ def handler_validate_masterofdrums_chart(args: argparse.Namespace, config: Dict[
         expectations=expectations,
     )
 
-    build_argv = render_template_list(build_recipe["argv"], repo_info, template_vars)
-    build_env = render_template_map(build_recipe.get("env") or {}, repo_info, template_vars)
-    build_timeout = int(build_recipe.get("timeout_seconds", 600))
-    build_result = run_subprocess(build_argv, repo_info=repo_info, timeout=build_timeout, extra_env=build_env)
+    build_steps: List[Dict[str, Any]] = []
+    build_details: List[str] = []
+    for index, build_recipe in enumerate(build_recipes, start=1):
+        build_argv = render_template_list(build_recipe["argv"], repo_info, template_vars)
+        build_env = render_template_map(build_recipe.get("env") or {}, repo_info, template_vars)
+        build_timeout = int(build_recipe.get("timeout_seconds", 600))
+        build_result = run_subprocess(build_argv, repo_info=repo_info, timeout=build_timeout, extra_env=build_env)
+        step_payload = {
+            "index": index,
+            "status": "pass" if build_result["status"] == 0 else "fail",
+            "argv": build_argv,
+            "details": build_result["stdout"] or build_result["stderr"],
+            "stdout": build_result["stdout"],
+            "stderr": build_result["stderr"],
+        }
+        build_steps.append(step_payload)
+        if step_payload["details"]:
+            build_details.append(step_payload["details"])
+        if build_result["status"] != 0:
+            build_payload = {
+                "status": "fail",
+                "details": "\n".join(part for part in build_details if part).strip(),
+                "steps": build_steps,
+            }
+            raise AgentError("BUILD_FAILED", "masterofdrums build failed", build_result["status"], {"build": build_payload})
+
     build_payload = {
-        "status": "pass" if build_result["status"] == 0 else "fail",
-        "details": build_result["stdout"] or build_result["stderr"],
-        "stdout": build_result["stdout"],
-        "stderr": build_result["stderr"],
+        "status": "pass",
+        "details": "\n".join(part for part in build_details if part).strip(),
+        "steps": build_steps,
     }
-    if build_result["status"] != 0:
-        raise AgentError("BUILD_FAILED", "masterofdrums build failed", build_result["status"], {"build": build_payload})
 
     import_payload: Dict[str, Any] = {
         "status": "skipped",
@@ -1009,6 +1044,11 @@ def handler_validate_masterofdrums_chart(args: argparse.Namespace, config: Dict[
         "audio": None if not audio_resolved_path else {"root": args.audio_root or "repo", "path": args.audio_path, "resolved_path": str(audio_resolved_path)},
         "timingContractVersion": None,
         "timing": {},
+        "stdout": "",
+        "stderr": "",
+    }
+    integration_payload: Dict[str, Any] = {
+        "status": "skipped",
         "stdout": "",
         "stderr": "",
     }
@@ -1021,6 +1061,7 @@ def handler_validate_masterofdrums_chart(args: argparse.Namespace, config: Dict[
     ui_observations: List[str] = []
     artifacts = {"screenshots": [], "logs": [], "xcresult": None}
     errors: List[Dict[str, Any]] = []
+    warnings: List[Any] = []
 
     if args.validation_mode != "build-only":
         import_argv = render_template_list(import_recipe["argv"], repo_info, template_vars)
@@ -1032,6 +1073,7 @@ def handler_validate_masterofdrums_chart(args: argparse.Namespace, config: Dict[
         import_payload["stderr"] = import_result["stderr"]
         parsed_import = parse_json_if_possible(import_result["stdout"])
         if isinstance(parsed_import, dict):
+            import_payload["status"] = parsed_import.get("status", import_payload["status"])
             import_payload["timingContractVersion"] = parsed_import.get("timingContractVersion")
             import_payload["timing"] = parsed_import.get("timing") or {}
             authority_checks.update(parsed_import.get("authorityChecks") or {})
@@ -1039,6 +1081,8 @@ def handler_validate_masterofdrums_chart(args: argparse.Namespace, config: Dict[
             parsed_artifacts = parsed_import.get("artifacts") or {}
             if isinstance(parsed_artifacts, dict):
                 artifacts.update(parsed_artifacts)
+            warnings.extend(parsed_import.get("warnings") or [])
+            errors.extend(parsed_import.get("errors") or [])
         if import_result["status"] != 0:
             raise AgentError("CHART_IMPORT_FAILED", "masterofdrums chart validation failed", import_result["status"], {"import": import_payload})
 
@@ -1046,10 +1090,35 @@ def handler_validate_masterofdrums_chart(args: argparse.Namespace, config: Dict[
         if mismatches:
             errors.extend({"code": "EXPECTED_TIMING_MISMATCH", "details": item} for item in mismatches)
 
+    if should_run_integration_recipe(args.validation_mode) and integration_recipe:
+        integration_argv = render_template_list(integration_recipe["argv"], repo_info, template_vars)
+        integration_env = render_template_map(integration_recipe.get("env") or {}, repo_info, template_vars)
+        integration_timeout = int(integration_recipe.get("timeout_seconds", 300))
+        integration_result = run_subprocess(integration_argv, repo_info=repo_info, timeout=integration_timeout, extra_env=integration_env)
+        integration_payload["status"] = "pass" if integration_result["status"] == 0 else "fail"
+        integration_payload["stdout"] = integration_result["stdout"]
+        integration_payload["stderr"] = integration_result["stderr"]
+        parsed_integration = parse_json_if_possible(integration_result["stdout"])
+        if isinstance(parsed_integration, dict):
+            integration_payload["status"] = parsed_integration.get("status", integration_payload["status"])
+            authority_checks.update(parsed_integration.get("authorityChecks") or {})
+            ui_observations.extend(parsed_integration.get("uiObservations") or [])
+            parsed_artifacts = parsed_integration.get("artifacts") or {}
+            if isinstance(parsed_artifacts, dict):
+                artifacts.update(parsed_artifacts)
+            warnings.extend(parsed_integration.get("warnings") or [])
+            errors.extend(parsed_integration.get("errors") or [])
+        if integration_result["status"] != 0:
+            raise AgentError("INTEGRATION_VALIDATION_FAILED", "masterofdrums integration validation failed", integration_result["status"], {"integration": integration_payload})
+
     status = "pass"
     if errors:
         status = "fail"
+    elif warnings or import_payload["status"] == "partial":
+        status = "partial"
     elif args.validation_mode != "build-only" and import_payload["status"] != "pass":
+        status = "fail"
+    elif integration_payload["status"] not in {"skipped", "pass"}:
         status = "fail"
 
     return {
@@ -1059,10 +1128,12 @@ def handler_validate_masterofdrums_chart(args: argparse.Namespace, config: Dict[
         "sync": {key: sync[key] for key in ("branch", "expected_commit", "resolved_commit", "head")},
         "build": build_payload,
         "import": import_payload,
+        "integration": integration_payload,
         "expectations": expectations,
         "authorityChecks": authority_checks,
         "uiObservations": ui_observations,
         "artifacts": artifacts,
+        "warnings": warnings,
         "errors": errors,
     }
 

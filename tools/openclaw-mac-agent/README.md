@@ -50,13 +50,21 @@ config/masterofdrums-pipeline.example.json
 
 and adapt the `validate-analyzer` and `pipeline_profiles.debug` recipes to match the real repo scripts that should be exposed remotely.
 
-For app-level `masterofdrums` validation, add a separate repo entry with `app_validation.build_recipe` and `app_validation.import_recipe`. The new `validate-masterofdrums-chart` verb will:
+For app-level `masterofdrums` validation, add a separate repo entry with `app_validation.build_recipe` or `app_validation.build_recipes`, plus `app_validation.import_recipe`. You can optionally add `app_validation.integration_recipe` for richer controller/UI-state checks. The new `validate-masterofdrums-chart` verb will:
 
 - `git-sync` the repo to an exact branch and commit
 - resolve chart/audio paths against named roots
-- run the configured build recipe
+- run the configured build recipe or build step sequence
 - run the configured chart-import/timing validation recipe
+- optionally run a configured integration validation recipe for `manual-override`, `mismatch-diagnostic`, or `full`
 - return structured JSON for build/import/authority-check results
+
+For the current `masterofdrums` SwiftPM layout, prefer `build_recipes` with:
+
+- `swift build --package-path {repo}`
+- `swift test --package-path {repo}`
+
+If the app later grows a committed Xcode project or workspace, you can switch the build stage to an allowlisted `xcodebuild` recipe instead.
 
 The checked-in `masterofdrums-pipeline` example now targets the real app flow:
 

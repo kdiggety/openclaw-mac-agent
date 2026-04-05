@@ -89,23 +89,32 @@
         "screenshots": "{repo}/screenshots"
       },
       "app_validation": {
-        "build_recipe": {
-          "argv": [
-            "/usr/bin/xcrun",
-            "xcodebuild",
-            "-project",
-            "{repo}/MasterOfDrums.xcodeproj",
-            "-scheme",
-            "MasterOfDrums",
-            "-configuration",
-            "Debug",
-            "build"
-          ],
-          "timeout_seconds": 900
-        },
+        "build_recipes": [
+          {
+            "argv": [
+              "/usr/bin/env",
+              "swift",
+              "build",
+              "--package-path",
+              "{repo}"
+            ],
+            "timeout_seconds": 900
+          },
+          {
+            "argv": [
+              "/usr/bin/env",
+              "swift",
+              "test",
+              "--package-path",
+              "{repo}"
+            ],
+            "timeout_seconds": 900
+          }
+        ],
         "import_recipe": {
           "argv": [
-            "{repo}/scripts/validate-chart-import.sh",
+            "/usr/bin/python3",
+            "{agent_repo}/scripts/validate-masterofdrums-chart-headless.py",
             "--chart",
             "{chart_resolved_path}",
             "--mode",
@@ -120,6 +129,19 @@
             "{expected_ticks_per_beat}",
             "--expected-time-signature",
             "{expected_time_signature}",
+            "--expected-timing-source",
+            "{expected_timing_source}"
+          ],
+          "timeout_seconds": 600
+        },
+        "integration_recipe": {
+          "argv": [
+            "/usr/bin/python3",
+            "{repo}/scripts/validate-masterofdrums-ui-state.py",
+            "--chart",
+            "{chart_resolved_path}",
+            "--mode",
+            "{validation_mode}",
             "--expected-timing-source",
             "{expected_timing_source}"
           ],

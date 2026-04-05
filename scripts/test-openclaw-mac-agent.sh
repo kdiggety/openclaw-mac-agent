@@ -21,7 +21,9 @@ printf 'line1\nline2\nline3\n' > "${FAKE_REPO}/logs/pipeline.log"
 printf '{"meta":{"name":"demo"},"events":[1,2,3],"tempo_map":[120]}\n' > "${FAKE_REPO}/output/latest/base-chart.json"
 printf 'hello world\n' > "${FAKE_REPO}/README.txt"
 printf 'fake' > "${FAKE_REPO}/tmp/input.wav"
-printf '{"timingContractVersion":"0.1.0","timing":{"bpm":120.0,"offsetSeconds":0.0,"ticksPerBeat":480,"timeSignature":{"numerator":4,"denominator":4},"source":"generated"}}\n' > "${FAKE_APP_REPO}/fixtures/chart.json"
+cat > "${FAKE_APP_REPO}/fixtures/chart.json" <<'EOF'
+{"title":"Fixture Song","bpm":120.0,"timingContractVersion":1,"timing":{"bpm":120.0,"offsetSeconds":0.0,"ticksPerBeat":480,"timeSignature":{"numerator":4,"denominator":4},"source":"generated"},"timelineDuration":8.0,"notes":[{"lane":0,"time":0.0},{"lane":1,"time":1.0}],"sections":[{"name":"Intro","startTime":0.0,"endTime":4.0,"colorName":"blue"}]}
+EOF
 printf 'audio' > "${FAKE_APP_REPO}/fixtures/song.mp3"
 
 cat > "${FAKE_REPO}/scripts/validate_analyzer.py" <<'EOF'
@@ -64,35 +66,33 @@ set -euo pipefail
 echo "build ok"
 EOF
 
-cat > "${FAKE_APP_REPO}/scripts/validate_chart.py" <<'EOF'
+cat > "${FAKE_APP_REPO}/scripts/run_package_tests.sh" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+echo "test ok"
+EOF
+
+cat > "${FAKE_APP_REPO}/scripts/validate_ui_state.py" <<'EOF'
 #!/usr/bin/env python3
 import argparse
 import json
-from pathlib import Path
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--chart", required=True)
 parser.add_argument("--mode", required=True)
-parser.add_argument("--audio", default="")
-parser.add_argument("--expected-bpm", default="")
-parser.add_argument("--expected-offset-seconds", default="")
-parser.add_argument("--expected-ticks-per-beat", default="")
-parser.add_argument("--expected-time-signature", default="")
 parser.add_argument("--expected-timing-source", default="")
 args = parser.parse_args()
 
-payload = json.loads(Path(args.chart).read_text())
-result = {
-    "timingContractVersion": payload["timingContractVersion"],
-    "timing": payload["timing"],
+payload = {
+    "status": "pass",
     "authorityChecks": {
         "generatedTimingAuthoritative": True,
         "audioDetectionDiagnosticOnly": True,
-        "manualOverrideExplicit": args.mode in {"manual-override", "full"},
+        "manualOverrideExplicit": True if args.mode in {"manual-override", "full"} else None,
         "timeSignatureRespected": True,
     },
     "uiObservations": [
-        "Timing source displayed as Chart Timing v0.1.0",
+        "Timing source displayed as Chart Timing v0.1.0 · Generated",
         "Audio BPM shown as diagnostic only",
     ],
     "artifacts": {
@@ -100,11 +100,13 @@ result = {
         "logs": [],
         "xcresult": None,
     },
+    "warnings": [],
+    "errors": [],
 }
-print(json.dumps(result))
+print(json.dumps(payload))
 EOF
 
-chmod +x "${FAKE_APP_REPO}/scripts/build_app.sh" "${FAKE_APP_REPO}/scripts/validate_chart.py"
+chmod +x "${FAKE_APP_REPO}/scripts/build_app.sh" "${FAKE_APP_REPO}/scripts/run_package_tests.sh" "${FAKE_APP_REPO}/scripts/validate_ui_state.py"
 
 cd "${FAKE_REPO}"
 git init >/dev/null
@@ -175,16 +177,24 @@ cat > "${FAKE_CONFIG}" <<EOF
         "runs": "{repo}/runs"
       },
       "app_validation": {
-        "build_recipe": {
-          "argv": [
-            "{repo}/scripts/build_app.sh"
-          ],
-          "timeout_seconds": 30
-        },
+        "build_recipes": [
+          {
+            "argv": [
+              "{repo}/scripts/build_app.sh"
+            ],
+            "timeout_seconds": 30
+          },
+          {
+            "argv": [
+              "{repo}/scripts/run_package_tests.sh"
+            ],
+            "timeout_seconds": 30
+          }
+        ],
         "import_recipe": {
           "argv": [
             "/usr/bin/python3",
-            "{repo}/scripts/validate_chart.py",
+            "{agent_repo}/scripts/validate-masterofdrums-chart-headless.py",
             "--chart",
             "{chart_resolved_path}",
             "--mode",
@@ -199,6 +209,19 @@ cat > "${FAKE_CONFIG}" <<EOF
             "{expected_ticks_per_beat}",
             "--expected-time-signature",
             "{expected_time_signature}",
+            "--expected-timing-source",
+            "{expected_timing_source}"
+          ],
+          "timeout_seconds": 30
+        },
+        "integration_recipe": {
+          "argv": [
+            "/usr/bin/python3",
+            "{repo}/scripts/validate_ui_state.py",
+            "--chart",
+            "{chart_resolved_path}",
+            "--mode",
+            "{validation_mode}",
             "--expected-timing-source",
             "{expected_timing_source}"
           ],
@@ -314,9 +337,15 @@ WRAPPER_JSON="$(OPENCLAW_MAC_AGENT_CONFIG="${FAKE_CONFIG}" OPENCLAW_MAC_AGENT_HO
 
 printf 'Phase 12: validate-masterofdrums-chart\n'
 APP_HEAD="$(git -C "${FAKE_APP_REPO}" rev-parse HEAD)"
-APP_VALIDATE_JSON="$(run_json validate-masterofdrums-chart --repo masterofdrums --branch "${APP_BRANCH}" --expected-commit "${APP_HEAD}" --chart-root fixtures --chart-path chart.json --audio-root fixtures --audio-path song.mp3 --validation-mode full --expected-bpm 120 --expected-offset-seconds 0 --expected-ticks-per-beat 480 --expected-time-signature 4/4 --expected-timing-source generated --json)"
+APP_VALIDATE_JSON="$(run_json validate-masterofdrums-chart --repo masterofdrums --branch "${APP_BRANCH}" --expected-commit "${APP_HEAD}" --chart-root fixtures --chart-path chart.json --audio-root fixtures --audio-path song.mp3 --validation-mode import-timing --expected-bpm 120 --expected-offset-seconds 0 --expected-ticks-per-beat 480 --expected-time-signature 4/4 --expected-timing-source generated --json)"
 [[ "$(json_field "$APP_VALIDATE_JSON" "ok")" == "True" || "$(json_field "$APP_VALIDATE_JSON" "ok")" == "true" ]]
 [[ "$(json_field "$APP_VALIDATE_JSON" "data.status")" == "pass" ]]
 [[ "$(json_field "$APP_VALIDATE_JSON" "data.import.timing.source")" == "generated" ]]
+
+printf 'Phase 12b: validate-masterofdrums-chart full integration\n'
+APP_VALIDATE_FULL_JSON="$(run_json validate-masterofdrums-chart --repo masterofdrums --branch "${APP_BRANCH}" --expected-commit "${APP_HEAD}" --chart-root fixtures --chart-path chart.json --audio-root fixtures --audio-path song.mp3 --validation-mode full --expected-bpm 120 --expected-offset-seconds 0 --expected-ticks-per-beat 480 --expected-time-signature 4/4 --expected-timing-source generated --json)"
+[[ "$(json_field "$APP_VALIDATE_FULL_JSON" "ok")" == "True" || "$(json_field "$APP_VALIDATE_FULL_JSON" "ok")" == "true" ]]
+[[ "$(json_field "$APP_VALIDATE_FULL_JSON" "data.integration.status")" == "pass" ]]
+[[ "$(json_field "$APP_VALIDATE_FULL_JSON" "data.authorityChecks.manualOverrideExplicit")" == "True" || "$(json_field "$APP_VALIDATE_FULL_JSON" "data.authorityChecks.manualOverrideExplicit")" == "true" ]]
 
 printf '\nAll openclaw-mac-agent smoke phases passed.\n'
