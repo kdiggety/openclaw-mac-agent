@@ -10,9 +10,11 @@ openclaw-mac-agent SSH surface:
 
   1. git-sync to an exact branch and commit
   2. env-check
-  3. validate-analyzer
-  4. run-pipeline
-  5. poll get-run-status until completion
+  3. swift-build
+  4. swift-test
+  5. validate-analyzer
+  6. run-pipeline
+  7. poll get-run-status until completion
 
 Required environment:
   TARGET_BRANCH              branch OpenClaw wants tested
@@ -37,11 +39,12 @@ Exit codes:
   0  validation succeeded
   1  git-sync failed
   2  env-check failed
-  3  validate-analyzer failed
-  4  run-pipeline start failed
-  5  run-pipeline completed with failure
-  6  polling timed out
-  7  wrapper/runtime error
+  3  swift-build failed
+  4  swift-test failed
+  5  validate-analyzer failed
+  6  run-pipeline start failed
+  7  run-pipeline completed with failure / wrapper-runtime error
+  8  polling timed out
 USAGE
 }
 
@@ -236,6 +239,32 @@ if [[ "$ENV_STATUS" -ne 0 || "$(json_field "$ENV_JSON" "ok")" != "true" ]]; then
   exit 2
 fi
 
+BUILD_STATUS=0
+BUILD_JSON="$(run_remote_json_capture swift-build)" || BUILD_STATUS=$?
+[[ -n "$BUILD_JSON" ]] || {
+  printf 'swift-build returned no JSON output\n' >&2
+  exit 7
+}
+BUILD_JSON="$(json_compact "$BUILD_JSON")"
+print_stage swift-build "$BUILD_JSON"
+if [[ "$BUILD_STATUS" -ne 0 || "$(json_field "$BUILD_JSON" "ok")" != "true" || "$(json_field "$BUILD_JSON" "data.status")" != "pass" ]]; then
+  printf '%s\n' "$BUILD_JSON"
+  exit 3
+fi
+
+TEST_STATUS=0
+TEST_JSON="$(run_remote_json_capture swift-test)" || TEST_STATUS=$?
+[[ -n "$TEST_JSON" ]] || {
+  printf 'swift-test returned no JSON output\n' >&2
+  exit 7
+}
+TEST_JSON="$(json_compact "$TEST_JSON")"
+print_stage swift-test "$TEST_JSON"
+if [[ "$TEST_STATUS" -ne 0 || "$(json_field "$TEST_JSON" "ok")" != "true" || "$(json_field "$TEST_JSON" "data.status")" != "pass" ]]; then
+  printf '%s\n' "$TEST_JSON"
+  exit 4
+fi
+
 mapfile -t RESOLVE_ARGS < <(resolve_sources_args)
 RESOLVE_STATUS=0
 RESOLVE_JSON="$(run_remote_json_capture resolve-sources "${RESOLVE_ARGS[@]}")" || RESOLVE_STATUS=$?
@@ -247,7 +276,7 @@ RESOLVE_JSON="$(json_compact "$RESOLVE_JSON")"
 print_stage resolve-sources "$RESOLVE_JSON"
 if [[ "$RESOLVE_STATUS" -ne 0 || "$(json_field "$RESOLVE_JSON" "ok")" != "true" ]]; then
   printf '%s\n' "$RESOLVE_JSON"
-  exit 3
+  exit 5
 fi
 
 ANALYZER_RESULTS_FILE="$(mktemp)"
@@ -272,7 +301,7 @@ while IFS=$'\t' read -r RESOLVED_NAME RESOLVED_URI; do
     print_stage validate-analyzer "$ANALYZER_JSON"
     if [[ "$ANALYZER_STATUS" -ne 0 || "$(json_field "$ANALYZER_JSON" "ok")" != "true" ]]; then
       printf '%s\n' "$ANALYZER_JSON"
-      exit 3
+      exit 5
     fi
     printf '%s\n' "$ANALYZER_JSON" >> "$ANALYZER_RESULTS_FILE"
   fi
@@ -287,7 +316,7 @@ while IFS=$'\t' read -r RESOLVED_NAME RESOLVED_URI; do
   print_stage run-pipeline "$RUN_JSON"
   if [[ "$RUN_STATUS" -ne 0 || "$(json_field "$RUN_JSON" "ok")" != "true" ]]; then
     printf '%s\n' "$RUN_JSON"
-    exit 4
+    exit 6
   fi
   printf '%s\n' "$RUN_JSON" >> "$RUN_STARTED_FILE"
 
@@ -300,7 +329,7 @@ while IFS=$'\t' read -r RESOLVED_NAME RESOLVED_URI; do
     ELAPSED=$((NOW - START_TIME))
     if (( ELAPSED > POLL_TIMEOUT_SECONDS )); then
       printf 'polling timed out after %ss for run %s\n' "$POLL_TIMEOUT_SECONDS" "$RUN_ID" >&2
-      exit 6
+      exit 8
     fi
 
     STATUS_PAYLOAD="$(run_remote_json get-run-status --run-id "$RUN_ID")"
@@ -327,6 +356,8 @@ fi
 RESULT_JSON="$(
   OPENCLAW_SYNC_JSON="$SYNC_JSON" \
   OPENCLAW_ENV_JSON="$ENV_JSON" \
+  OPENCLAW_BUILD_JSON="$BUILD_JSON" \
+  OPENCLAW_TEST_JSON="$TEST_JSON" \
   OPENCLAW_RESOLVE_JSON="$RESOLVE_JSON" \
   OPENCLAW_ANALYZER_RESULTS_FILE="$ANALYZER_RESULTS_FILE" \
   OPENCLAW_RUN_STARTED_FILE="$RUN_STARTED_FILE" \
@@ -337,6 +368,8 @@ import os
 
 sync = json.loads(os.environ["OPENCLAW_SYNC_JSON"])
 env = json.loads(os.environ["OPENCLAW_ENV_JSON"])
+build = json.loads(os.environ["OPENCLAW_BUILD_JSON"])
+test = json.loads(os.environ["OPENCLAW_TEST_JSON"])
 resolve = json.loads(os.environ["OPENCLAW_RESOLVE_JSON"])
 
 def load_json_lines(path_env):
@@ -352,12 +385,12 @@ all_artifacts = []
 base_charts = []
 normalized_artifacts = []
 audio_analysis_artifacts = []
-overall_ok = True
+scenario_ok = True
 
 for item in run_final:
     run_info = item["data"]["run"]
     if run_info["status"] != "completed" or run_info.get("exit_code") != 0:
-        overall_ok = False
+        scenario_ok = False
     for artifact in run_info.get("artifacts", []):
         all_artifacts.append(artifact)
         if artifact.get("type") == "base_chart":
@@ -367,6 +400,10 @@ for item in run_final:
         elif artifact.get("type") == "audio_analysis":
             audio_analysis_artifacts.append(artifact["uri"])
 
+build_ok = build["data"]["status"] == "pass"
+test_ok = test["data"]["status"] == "pass"
+analyzer_ok = all(item["data"]["validation"].get("imports_ok") for item in analyzer_results) if analyzer_results else True
+overall_ok = build_ok and test_ok and analyzer_ok and scenario_ok
 status = "validation-passed" if overall_ok else "validation-failed"
 
 payload = {
@@ -374,6 +411,8 @@ payload = {
     "repo": resolve["data"]["repo"],
     "sync": sync["data"]["git"],
     "env_check": env["data"],
+    "build": build["data"],
+    "test": test["data"],
     "resolved_sources": resolve["data"]["sources"],
     "validate_analyzer": [item["data"] for item in analyzer_results],
     "runs_started": [item["data"]["run"] for item in run_started],
@@ -384,6 +423,10 @@ payload = {
         "audio_analysis": audio_analysis_artifacts[0] if len(audio_analysis_artifacts) == 1 else audio_analysis_artifacts,
         "all": all_artifacts,
     },
+    "merge_readiness": {
+        "go": overall_ok,
+        "reason": "all required stages passed" if overall_ok else "one or more required stages failed",
+    },
 }
 print(json.dumps(payload, separators=(",", ":")))
 PY
@@ -392,5 +435,5 @@ PY
 printf '%s\n' "$RESULT_JSON"
 
 if [[ "$(json_field "$RESULT_JSON" "status")" != "validation-passed" ]]; then
-  exit 5
+  exit 7
 fi

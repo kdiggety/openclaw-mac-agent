@@ -32,6 +32,8 @@ The broader OpenClaw-facing contract currently supports:
 - `tail-file`
 - `list-artifacts`
 - `summarize-artifact`
+- `swift-build`
+- `swift-test`
 - `validate-analyzer`
 - `validate-masterofdrums-chart`
 - `run-pipeline`
@@ -216,6 +218,15 @@ The wrapper reports `jobId` values and remote artifact paths in JSON. Direct `rs
 For broader repo inspection and bounded pipeline debugging over SSH, use `openclaw-mac-agent` with its own forced-command wrapper instead of overloading `mac_worker`.
 
 The Linux/OpenClaw-side operational wrapper for the broader agent lives in this repo, not in `masterofdrums-pipeline`:
+
+Merge-readiness wrappers are being tightened so a green result means all required stages passed:
+
+1. exact git sync succeeded
+2. environment check succeeded
+3. `swift-build` succeeded
+4. `swift-test` succeeded
+5. scenario validation succeeded (`validate-masterofdrums-chart` and/or `run-pipeline`)
+6. wrapper reports `merge_readiness.go=true`
 
 - [`/Users/klewisjr/Development/MacOS/openclaw-mac-agent/scripts/run-openclaw-masterofdrums-validation.sh`](/Users/klewisjr/Development/MacOS/openclaw-mac-agent/scripts/run-openclaw-masterofdrums-validation.sh)
 

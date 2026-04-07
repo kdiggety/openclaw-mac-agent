@@ -34,6 +34,8 @@ PUBLIC_VERBS = {
     "tail-file",
     "list-artifacts",
     "summarize-artifact",
+    "swift-build",
+    "swift-test",
     "validate-analyzer",
     "validate-masterofdrums-chart",
     "run-pipeline",
@@ -779,6 +781,66 @@ def handler_resolve_sources(args: argparse.Namespace, config: Dict[str, Any], re
     }
 
 
+def default_swift_package_recipe(repo_info: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
+    if mode == "build":
+        argv = ["/usr/bin/env", "swift", "build", "--package-path", "{repo}"]
+    elif mode == "test":
+        argv = ["/usr/bin/env", "swift", "test", "--package-path", "{repo}"]
+    else:
+        raise AgentError("INVALID_SWIFT_MODE", f"Invalid Swift recipe mode: {mode}", 22, {"mode": mode})
+    return {"argv": argv, "timeout_seconds": 900}
+
+
+
+def resolve_validation_recipe(repo_info: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
+    repo_cfg = repo_info["config"]
+    if mode == "build":
+        keys = ("build_recipe", "swift_build_recipe")
+    elif mode == "test":
+        keys = ("test_recipe", "swift_test_recipe")
+    else:
+        raise AgentError("INVALID_VALIDATION_MODE", f"Invalid validation recipe mode: {mode}", 22, {"mode": mode})
+
+    for parent_key in ("validation", "app_validation"):
+        cfg = repo_cfg.get(parent_key) or {}
+        for key in keys:
+            recipe = cfg.get(key)
+            if recipe:
+                return recipe
+
+    return default_swift_package_recipe(repo_info, mode=mode)
+
+
+
+def run_validation_recipe(repo_info: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
+    recipe = resolve_validation_recipe(repo_info, mode=mode)
+    argv = render_template_list(recipe["argv"], repo_info)
+    recipe_env = render_template_map(recipe.get("env") or {}, repo_info)
+    timeout = int(recipe.get("timeout_seconds", 900))
+    result = run_subprocess(argv, repo_info=repo_info, timeout=timeout, extra_env=recipe_env)
+    status = "pass" if result["status"] == 0 else "fail"
+    return {
+        "repo": repo_info["name"],
+        "stage": mode,
+        "status": status,
+        "command": argv,
+        "exit_code": result["status"],
+        "stdout": result["stdout"],
+        "stderr": result["stderr"],
+    }
+
+
+
+def handler_swift_build(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    return run_validation_recipe(repo_info, mode="build")
+
+
+
+def handler_swift_test(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    return run_validation_recipe(repo_info, mode="test")
+
+
+
 def handler_validate_analyzer(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
     venv_python = repo_info["path"] / ".venv" / "bin" / "python"
     repo_cfg = repo_info["config"]
@@ -1350,6 +1412,8 @@ HANDLERS = {
     "tail-file": handler_tail_file,
     "list-artifacts": handler_list_artifacts,
     "summarize-artifact": handler_summarize_artifact,
+    "swift-build": handler_swift_build,
+    "swift-test": handler_swift_test,
     "validate-analyzer": handler_validate_analyzer,
     "validate-masterofdrums-chart": handler_validate_masterofdrums_chart,
     "run-pipeline": handler_run_pipeline,
@@ -1406,6 +1470,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser_summary.add_argument("--root", default="repo")
     parser_summary.add_argument("--path", required=True)
     parser_summary.add_argument("--json", action="store_true")
+
+    parser_swift_build = subparsers.add_parser("swift-build")
+    parser_swift_build.add_argument("--repo", required=True)
+    parser_swift_build.add_argument("--json", action="store_true")
+
+    parser_swift_test = subparsers.add_parser("swift-test")
+    parser_swift_test.add_argument("--repo", required=True)
+    parser_swift_test.add_argument("--json", action="store_true")
 
     parser_validate = subparsers.add_parser("validate-analyzer")
     parser_validate.add_argument("--repo", required=True)

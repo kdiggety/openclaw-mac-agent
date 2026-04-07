@@ -10,7 +10,9 @@ openclaw-mac-agent SSH surface:
 
   1. git-sync to an exact branch and commit
   2. env-check
-  3. validate-masterofdrums-chart
+  3. swift-build
+  4. swift-test
+  5. validate-masterofdrums-chart
 
 Required environment:
   TARGET_BRANCH              branch OpenClaw wants tested
@@ -38,7 +40,9 @@ Exit codes:
   0  validation succeeded
   1  git-sync failed
   2  env-check failed
-  3  validate-masterofdrums-chart failed
+  3  swift-build failed
+  4  swift-test failed
+  5  validate-masterofdrums-chart failed
   7  wrapper/runtime error
 USAGE
 }
@@ -199,6 +203,32 @@ if [[ "$ENV_STATUS" -ne 0 || "$(json_field "$ENV_JSON" "ok")" != "true" ]]; then
   exit 2
 fi
 
+BUILD_STATUS=0
+BUILD_JSON="$(run_remote_json_capture swift-build)" || BUILD_STATUS=$?
+[[ -n "$BUILD_JSON" ]] || {
+  printf 'swift-build returned no JSON output\n' >&2
+  exit 7
+}
+BUILD_JSON="$(json_compact "$BUILD_JSON")"
+print_stage swift-build "$BUILD_JSON"
+if [[ "$BUILD_STATUS" -ne 0 || "$(json_field "$BUILD_JSON" "ok")" != "true" || "$(json_field "$BUILD_JSON" "data.status")" != "pass" ]]; then
+  printf '%s\n' "$BUILD_JSON"
+  exit 3
+fi
+
+TEST_STATUS=0
+TEST_JSON="$(run_remote_json_capture swift-test)" || TEST_STATUS=$?
+[[ -n "$TEST_JSON" ]] || {
+  printf 'swift-test returned no JSON output\n' >&2
+  exit 7
+}
+TEST_JSON="$(json_compact "$TEST_JSON")"
+print_stage swift-test "$TEST_JSON"
+if [[ "$TEST_STATUS" -ne 0 || "$(json_field "$TEST_JSON" "ok")" != "true" || "$(json_field "$TEST_JSON" "data.status")" != "pass" ]]; then
+  printf '%s\n' "$TEST_JSON"
+  exit 4
+fi
+
 VALIDATE_ARGS=(
   --branch "$TARGET_BRANCH"
   --expected-commit "$EXPECTED_COMMIT"
@@ -242,6 +272,8 @@ fi
 RESULT_JSON="$(
   OPENCLAW_SYNC_JSON="$SYNC_JSON" \
   OPENCLAW_ENV_JSON="$ENV_JSON" \
+  OPENCLAW_BUILD_JSON="$BUILD_JSON" \
+  OPENCLAW_TEST_JSON="$TEST_JSON" \
   OPENCLAW_VALIDATE_JSON="$VALIDATE_JSON" \
   python3 - <<'PY'
 import json
@@ -249,14 +281,23 @@ import os
 
 sync = json.loads(os.environ["OPENCLAW_SYNC_JSON"])
 env = json.loads(os.environ["OPENCLAW_ENV_JSON"])
+build = json.loads(os.environ["OPENCLAW_BUILD_JSON"])
+test = json.loads(os.environ["OPENCLAW_TEST_JSON"])
 validate = json.loads(os.environ["OPENCLAW_VALIDATE_JSON"])
 
+all_ok = build["data"]["status"] == "pass" and test["data"]["status"] == "pass" and validate["data"]["status"] == "pass"
 payload = {
-    "status": "validation-passed" if validate["data"]["status"] == "pass" else "validation-failed",
+    "status": "validation-passed" if all_ok else "validation-failed",
     "repo": validate["data"]["repo"],
     "sync": sync["data"]["git"],
     "env_check": env["data"],
+    "build": build["data"],
+    "test": test["data"],
     "validation": validate["data"],
+    "merge_readiness": {
+        "go": all_ok,
+        "reason": "all required stages passed" if all_ok else "one or more required stages failed",
+    },
 }
 print(json.dumps(payload, separators=(",", ":")))
 PY
@@ -265,5 +306,5 @@ PY
 printf '%s\n' "$RESULT_JSON"
 
 if [[ "$(json_field "$RESULT_JSON" "status")" != "validation-passed" ]]; then
-  exit 3
+  exit 5
 fi
