@@ -138,6 +138,26 @@ cat > "${FAKE_CONFIG}" <<EOF
       "sample_sources": {
         "fixture-input": "file://${FAKE_REPO}/tmp/input.wav"
       },
+      "validation": {
+        "build_recipe": {
+          "argv": [
+            "/usr/bin/env",
+            "python3",
+            "-c",
+            "print('pipeline build ok')"
+          ],
+          "timeout_seconds": 30
+        },
+        "test_recipe": {
+          "argv": [
+            "/usr/bin/env",
+            "python3",
+            "-c",
+            "print('pipeline test ok')"
+          ],
+          "timeout_seconds": 30
+        }
+      },
       "sample_sets": {
         "smoke": [
           "fixture-input"
@@ -177,6 +197,18 @@ cat > "${FAKE_CONFIG}" <<EOF
         "runs": "{repo}/runs"
       },
       "app_validation": {
+        "build_recipe": {
+          "argv": [
+            "{repo}/scripts/build_app.sh"
+          ],
+          "timeout_seconds": 30
+        },
+        "test_recipe": {
+          "argv": [
+            "{repo}/scripts/run_package_tests.sh"
+          ],
+          "timeout_seconds": 30
+        },
         "build_recipes": [
           {
             "argv": [
@@ -299,6 +331,14 @@ INPUT_FILE="${FAKE_REPO}/tmp/input.wav"
 VAL_JSON="$(run_json validate-analyzer --repo masterofdrums-pipeline --source-uri "file://${INPUT_FILE}" --json)"
 [[ "$(json_field "$VAL_JSON" "ok")" == "True" || "$(json_field "$VAL_JSON" "ok")" == "true" ]]
 
+printf 'Phase 7a: swift-build / swift-test\n'
+PIPE_BUILD_JSON="$(run_json swift-build --repo masterofdrums-pipeline --json)"
+[[ "$(json_field "$PIPE_BUILD_JSON" "ok")" == "True" || "$(json_field "$PIPE_BUILD_JSON" "ok")" == "true" ]]
+[[ "$(json_field "$PIPE_BUILD_JSON" "data.status")" == "pass" ]]
+PIPE_TEST_JSON="$(run_json swift-test --repo masterofdrums-pipeline --json)"
+[[ "$(json_field "$PIPE_TEST_JSON" "ok")" == "True" || "$(json_field "$PIPE_TEST_JSON" "ok")" == "true" ]]
+[[ "$(json_field "$PIPE_TEST_JSON" "data.status")" == "pass" ]]
+
 printf 'Phase 7b: validate-analyzer default sample\n'
 VAL_DEFAULT_JSON="$(run_json validate-analyzer --repo masterofdrums-pipeline --profile debug --json)"
 [[ "$(json_field "$VAL_DEFAULT_JSON" "ok")" == "True" || "$(json_field "$VAL_DEFAULT_JSON" "ok")" == "true" ]]
@@ -337,6 +377,12 @@ WRAPPER_JSON="$(OPENCLAW_MAC_AGENT_CONFIG="${FAKE_CONFIG}" OPENCLAW_MAC_AGENT_HO
 
 printf 'Phase 12: validate-masterofdrums-chart\n'
 APP_HEAD="$(git -C "${FAKE_APP_REPO}" rev-parse HEAD)"
+APP_BUILD_JSON="$(run_json swift-build --repo masterofdrums --json)"
+[[ "$(json_field "$APP_BUILD_JSON" "ok")" == "True" || "$(json_field "$APP_BUILD_JSON" "ok")" == "true" ]]
+[[ "$(json_field "$APP_BUILD_JSON" "data.status")" == "pass" ]]
+APP_TEST_JSON="$(run_json swift-test --repo masterofdrums --json)"
+[[ "$(json_field "$APP_TEST_JSON" "ok")" == "True" || "$(json_field "$APP_TEST_JSON" "ok")" == "true" ]]
+[[ "$(json_field "$APP_TEST_JSON" "data.status")" == "pass" ]]
 APP_VALIDATE_JSON="$(run_json validate-masterofdrums-chart --repo masterofdrums --branch "${APP_BRANCH}" --expected-commit "${APP_HEAD}" --chart-root fixtures --chart-path chart.json --audio-root fixtures --audio-path song.mp3 --validation-mode import-timing --expected-bpm 120 --expected-offset-seconds 0 --expected-ticks-per-beat 480 --expected-time-signature 4/4 --expected-timing-source generated --json)"
 [[ "$(json_field "$APP_VALIDATE_JSON" "ok")" == "True" || "$(json_field "$APP_VALIDATE_JSON" "ok")" == "true" ]]
 [[ "$(json_field "$APP_VALIDATE_JSON" "data.status")" == "pass" ]]
@@ -347,5 +393,23 @@ APP_VALIDATE_FULL_JSON="$(run_json validate-masterofdrums-chart --repo masterofd
 [[ "$(json_field "$APP_VALIDATE_FULL_JSON" "ok")" == "True" || "$(json_field "$APP_VALIDATE_FULL_JSON" "ok")" == "true" ]]
 [[ "$(json_field "$APP_VALIDATE_FULL_JSON" "data.integration.status")" == "pass" ]]
 [[ "$(json_field "$APP_VALIDATE_FULL_JSON" "data.authorityChecks.manualOverrideExplicit")" == "True" || "$(json_field "$APP_VALIDATE_FULL_JSON" "data.authorityChecks.manualOverrideExplicit")" == "true" ]]
+
+printf 'Phase 13: fail closed when build/test config missing\n'
+MISSING_CONFIG="${TEST_ROOT}/repos-missing-validation.json"
+python3 - <<'PY' "${FAKE_CONFIG}" "${MISSING_CONFIG}"
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+payload = json.load(open(src, 'r', encoding='utf-8'))
+payload['repos']['masterofdrums-pipeline'].pop('validation', None)
+payload['repos']['masterofdrums']['app_validation'].pop('build_recipe', None)
+payload['repos']['masterofdrums']['app_validation'].pop('test_recipe', None)
+json.dump(payload, open(dst, 'w', encoding='utf-8'))
+PY
+MISSING_BUILD_JSON="$(OPENCLAW_MAC_AGENT_CONFIG="${MISSING_CONFIG}" OPENCLAW_MAC_AGENT_HOME="${FAKE_AGENT_HOME}" "${AGENT_BIN}" swift-build --repo masterofdrums-pipeline --json || true)"
+[[ "$(json_field "$MISSING_BUILD_JSON" "ok")" == "False" || "$(json_field "$MISSING_BUILD_JSON" "ok")" == "false" ]]
+[[ "$(json_field "$MISSING_BUILD_JSON" "error.code")" == "BUILD_NOT_CONFIGURED" ]]
+MISSING_TEST_JSON="$(OPENCLAW_MAC_AGENT_CONFIG="${MISSING_CONFIG}" OPENCLAW_MAC_AGENT_HOME="${FAKE_AGENT_HOME}" "${AGENT_BIN}" swift-test --repo masterofdrums --json || true)"
+[[ "$(json_field "$MISSING_TEST_JSON" "ok")" == "False" || "$(json_field "$MISSING_TEST_JSON" "ok")" == "false" ]]
+[[ "$(json_field "$MISSING_TEST_JSON" "error.code")" == "TEST_NOT_CONFIGURED" ]]
 
 printf '\nAll openclaw-mac-agent smoke phases passed.\n'

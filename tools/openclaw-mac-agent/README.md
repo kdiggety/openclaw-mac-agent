@@ -19,6 +19,8 @@
 - `tail-file`
 - `list-artifacts`
 - `summarize-artifact`
+- `swift-build`
+- `swift-test`
 - `validate-analyzer`
 - `validate-masterofdrums-chart`
 - `run-pipeline`
@@ -44,13 +46,19 @@ and update repo paths plus any recipe/profile commands needed for your project.
 
 For the current `masterofdrums-pipeline` worker layout, start from:
 
+Build/test stages are now fail-closed for merge-readiness flows:
+
+- `swift-build` requires an explicit configured build recipe
+- `swift-test` requires an explicit configured test recipe
+- wrappers should treat missing build/test config as `NO-GO`, not as a skipped or inferred pass
+
 ```text
 config/masterofdrums-pipeline.example.json
 ```
 
 and adapt the `validate-analyzer` and `pipeline_profiles.debug` recipes to match the real repo scripts that should be exposed remotely.
 
-For app-level `masterofdrums` validation, add a separate repo entry with `app_validation.build_recipe` or `app_validation.build_recipes`, plus `app_validation.import_recipe`. You can optionally add `app_validation.integration_recipe` for richer controller/UI-state checks. The new `validate-masterofdrums-chart` verb will:
+For app-level `masterofdrums` validation, add a separate repo entry with `app_validation.build_recipe`, `app_validation.test_recipe`, and `app_validation.import_recipe`. You can optionally add `app_validation.integration_recipe` for richer controller/UI-state checks. `app_validation.build_recipes` is still supported by `validate-masterofdrums-chart`, but merge-readiness wrappers now call `swift-build` and `swift-test` as separate required stages. The new `validate-masterofdrums-chart` verb will:
 
 - `git-sync` the repo to an exact branch and commit
 - resolve chart/audio paths against named roots

@@ -57,6 +57,28 @@ cat > "${CONFIG_PATH}" <<EOF
         "tmp": "{repo}/tmp",
         "runs": "{repo}/runs"
       },
+      "validation": {
+        "build_recipe": {
+          "argv": [
+            "/usr/bin/env",
+            "swift",
+            "build",
+            "--package-path",
+            "{repo}"
+          ],
+          "timeout_seconds": 900
+        },
+        "test_recipe": {
+          "argv": [
+            "/usr/bin/env",
+            "swift",
+            "test",
+            "--package-path",
+            "{repo}"
+          ],
+          "timeout_seconds": 900
+        }
+      },
       "recipes": {
         "validate-analyzer": {
           "argv": [

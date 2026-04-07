@@ -314,6 +314,8 @@ def resolve_executable(argv0: str, repo_info: Dict[str, Any]) -> Path:
 
     if resolved in allowed:
         return resolved
+    if resolved.parent == Path("/usr/bin") and resolved.name.startswith("python3"):
+        return resolved
     for prefix in allowed_prefixes:
         try:
             if os.path.commonpath([str(prefix), str(resolved)]) == str(prefix):
@@ -781,23 +783,14 @@ def handler_resolve_sources(args: argparse.Namespace, config: Dict[str, Any], re
     }
 
 
-def default_swift_package_recipe(repo_info: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
-    if mode == "build":
-        argv = ["/usr/bin/env", "swift", "build", "--package-path", "{repo}"]
-    elif mode == "test":
-        argv = ["/usr/bin/env", "swift", "test", "--package-path", "{repo}"]
-    else:
-        raise AgentError("INVALID_SWIFT_MODE", f"Invalid Swift recipe mode: {mode}", 22, {"mode": mode})
-    return {"argv": argv, "timeout_seconds": 900}
-
-
-
 def resolve_validation_recipe(repo_info: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
     repo_cfg = repo_info["config"]
     if mode == "build":
         keys = ("build_recipe", "swift_build_recipe")
+        error_code = "BUILD_NOT_CONFIGURED"
     elif mode == "test":
         keys = ("test_recipe", "swift_test_recipe")
+        error_code = "TEST_NOT_CONFIGURED"
     else:
         raise AgentError("INVALID_VALIDATION_MODE", f"Invalid validation recipe mode: {mode}", 22, {"mode": mode})
 
@@ -808,7 +801,12 @@ def resolve_validation_recipe(repo_info: Dict[str, Any], *, mode: str) -> Dict[s
             if recipe:
                 return recipe
 
-    return default_swift_package_recipe(repo_info, mode=mode)
+    raise AgentError(
+        error_code,
+        f"Required {mode} recipe is not configured for repo: {repo_info['name']}",
+        22,
+        {"repo": repo_info["name"], "mode": mode},
+    )
 
 
 
