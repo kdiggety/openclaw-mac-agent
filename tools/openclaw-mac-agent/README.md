@@ -13,6 +13,10 @@
 
 ## Verbs
 
+- `agent-version`
+- `self-update`
+- `config-status`
+- `refresh-config`
 - `env-check`
 - `repo-status`
 - `read-file`
@@ -99,6 +103,14 @@ If you already have the Linux-side public key available, the helper can also pri
 OPENCLAW_PUBLIC_KEY_FILE=~/.ssh/id_ed25519.pub \
 bash ./scripts/install-openclaw-mac-agent-config.sh openclaw-agent
 ```
+
+`agent-version` reports the deployed agent repo head/branch/dirty state.
+
+`self-update` performs a bounded `git fetch origin` + `git checkout --force <ref>` inside the agent repo only.
+
+`config-status` reports whether the current `repos.json` includes the expected app/pipeline validation sections.
+
+`refresh-config` reruns the checked-in installer script to regenerate a worker config without requiring shell access.
 
 ## SSH Forced Command
 

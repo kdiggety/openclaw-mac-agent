@@ -27,6 +27,10 @@ MAX_READ_BYTES = 65536
 MAX_TAIL_LINES = 500
 MAX_LIST_ITEMS = 500
 PUBLIC_VERBS = {
+    "agent-version",
+    "self-update",
+    "config-status",
+    "refresh-config",
     "env-check",
     "repo-status",
     "resolve-sources",
@@ -162,6 +166,24 @@ def response_envelope(
 
 def emit_json(payload: Dict[str, Any]) -> None:
     print(json.dumps(payload, separators=(",", ":")))
+
+
+def agent_repo_info() -> Dict[str, Any]:
+    repo_path = AGENT_REPO_ROOT.resolve()
+    roots = {
+        "repo": repo_path,
+        "logs": repo_path / "logs",
+        "artifacts": repo_path / "output",
+        "tmp": repo_path / "tmp",
+        "runs": repo_path / "runs",
+    }
+    return {
+        "name": "openclaw-mac-agent",
+        "path": repo_path,
+        "config": {},
+        "roots": roots,
+    }
+
 
 
 def parse_repo(config: Dict[str, Any], repo_name: str) -> Dict[str, Any]:
@@ -430,6 +452,101 @@ def parse_summary_artifacts(run_dir: Path) -> List[Dict[str, Any]]:
         return []
     items = payload.get("artifacts")
     return items if isinstance(items, list) else []
+
+
+def handler_agent_version(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    info = agent_repo_info()
+    branch = run_subprocess(["git", "branch", "--show-current"], repo_info=info, timeout=10)
+    head = run_subprocess(["git", "rev-parse", "HEAD"], repo_info=info, timeout=10)
+    status_lines = repo_status_lines(info)
+    remote = run_subprocess(["git", "remote", "-v"], repo_info=info, timeout=10)
+    return {
+        "agent_repo": str(info["path"]),
+        "branch": branch["stdout"].strip(),
+        "head": head["stdout"].strip(),
+        "is_dirty": bool(status_lines),
+        "changed_files": len([line for line in status_lines if not line.startswith("??")]),
+        "untracked_files": len([line for line in status_lines if line.startswith("??")]),
+        "status_short": status_lines,
+        "remotes": remote["stdout"].splitlines(),
+    }
+
+
+
+def handler_self_update(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    info = agent_repo_info()
+    ensure_clean_tree(info)
+    previous_head = git_head(info)
+    current_branch = run_subprocess(["git", "branch", "--show-current"], repo_info=info, timeout=10)["stdout"].strip()
+    ref = args.ref or "origin/main"
+
+    fetch_result = run_subprocess(["git", "fetch", "--prune", "origin"], repo_info=info, timeout=120)
+    verify_result = run_subprocess(["git", "rev-parse", "--verify", ref], repo_info=info, timeout=30)
+    if verify_result["status"] != 0:
+        raise AgentError("REF_NOT_FOUND", f"Update ref not found: {ref}", 22, {"ref": ref})
+
+    checkout_result = run_subprocess(["git", "checkout", "--force", ref], repo_info=info, timeout=120)
+    new_head = git_head(info)
+    status_lines = repo_status_lines(info)
+    return {
+        "status": "updated",
+        "agent_repo": str(info["path"]),
+        "previous_head": previous_head,
+        "new_head": new_head,
+        "ref": ref,
+        "branch_before": current_branch,
+        "branch_after": run_subprocess(["git", "branch", "--show-current"], repo_info=info, timeout=10)["stdout"].strip(),
+        "is_dirty_before": False,
+        "is_dirty_after": bool(status_lines),
+        "fetch": {"exit_code": fetch_result["status"], "stdout": fetch_result["stdout"], "stderr": fetch_result["stderr"]},
+        "checkout": {"exit_code": checkout_result["status"], "stdout": checkout_result["stdout"], "stderr": checkout_result["stderr"]},
+    }
+
+
+
+def handler_config_status(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    config_path = Path(config["_config_path"]).expanduser().resolve()
+    repos = config.get("repos") or {}
+    return {
+        "config_path": str(config_path),
+        "exists": config_path.exists(),
+        "repo_names": sorted(repos.keys()),
+        "has_masterofdrums": "masterofdrums" in repos,
+        "has_masterofdrums_pipeline": "masterofdrums-pipeline" in repos,
+        "masterofdrums_pipeline_validation": sorted((repos.get("masterofdrums-pipeline", {}).get("validation") or {}).keys()),
+        "masterofdrums_app_validation": sorted((repos.get("masterofdrums", {}).get("app_validation") or {}).keys()),
+    }
+
+
+
+def handler_refresh_config(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    info = agent_repo_info()
+    worker_user = args.worker_user or Path.home().name
+    app_repo_path = args.app_repo_path or f"/Users/{worker_user}/workspace/masterofdrums-pipeline"
+    config_path = args.config_path or str((Path.home() / ".config" / "openclaw-mac-agent" / "repos.json").expanduser())
+    result = run_subprocess(
+        [
+            "/usr/bin/env",
+            "bash",
+            str(AGENT_REPO_ROOT / "scripts" / "install-openclaw-mac-agent-config.sh"),
+            worker_user,
+            str(AGENT_REPO_ROOT),
+            app_repo_path,
+            config_path,
+        ],
+        repo_info=info,
+        timeout=120,
+    )
+    return {
+        "status": "refreshed" if result["status"] == 0 else "failed",
+        "worker_user": worker_user,
+        "config_path": config_path,
+        "app_repo_path": app_repo_path,
+        "exit_code": result["status"],
+        "stdout": result["stdout"],
+        "stderr": result["stderr"],
+    }
+
 
 
 def handler_env_check(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
@@ -1403,6 +1520,10 @@ def handler_git_sync(args: argparse.Namespace, config: Dict[str, Any], repo_info
 
 
 HANDLERS = {
+    "agent-version": handler_agent_version,
+    "self-update": handler_self_update,
+    "config-status": handler_config_status,
+    "refresh-config": handler_refresh_config,
     "env-check": handler_env_check,
     "repo-status": handler_repo_status,
     "resolve-sources": handler_resolve_sources,
@@ -1426,6 +1547,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="openclaw-mac-agent")
     parser.add_argument("--config", default=os.environ.get("OPENCLAW_MAC_AGENT_CONFIG"))
     subparsers = parser.add_subparsers(dest="verb", required=True)
+
+    parser_agent_version = subparsers.add_parser("agent-version")
+    parser_agent_version.add_argument("--json", action="store_true")
+
+    parser_self_update = subparsers.add_parser("self-update")
+    parser_self_update.add_argument("--ref")
+    parser_self_update.add_argument("--json", action="store_true")
+
+    parser_config_status = subparsers.add_parser("config-status")
+    parser_config_status.add_argument("--json", action="store_true")
+
+    parser_refresh_config = subparsers.add_parser("refresh-config")
+    parser_refresh_config.add_argument("--worker-user")
+    parser_refresh_config.add_argument("--app-repo-path")
+    parser_refresh_config.add_argument("--config-path")
+    parser_refresh_config.add_argument("--json", action="store_true")
 
     parser_env = subparsers.add_parser("env-check")
     parser_env.add_argument("--repo", required=True)
@@ -1555,7 +1692,10 @@ def main() -> int:
 
     try:
         config = load_config(args.config)
-        repo_info = parse_repo(config, args.repo)
+        if getattr(args, "repo", None):
+            repo_info = parse_repo(config, args.repo)
+        else:
+            repo_info = agent_repo_info()
         data = HANDLERS[args.verb](args, config, repo_info)
         payload = response_envelope(
             ok=True,
@@ -1571,7 +1711,7 @@ def main() -> int:
             "request_id": request_id,
             "caller": os.environ.get("SSH_CONNECTION", "local"),
             "verb": args.verb,
-            "repo": args.repo,
+            "repo": getattr(args, "repo", None),
             "exit_code": 0,
             "duration_ms": payload["duration_ms"],
             "timed_out": False,

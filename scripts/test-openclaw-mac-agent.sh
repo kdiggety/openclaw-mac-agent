@@ -297,6 +297,15 @@ run_json_allow_fail() {
   return ${status}
 }
 
+printf 'Phase 0: agent-version / config-status / refresh-config\n'
+AGENT_VERSION_JSON="$(run_json agent-version --json)"
+[[ "$(json_field "$AGENT_VERSION_JSON" "ok")" == "True" || "$(json_field "$AGENT_VERSION_JSON" "ok")" == "true" ]]
+CONFIG_STATUS_JSON="$(run_json config-status --json)"
+[[ "$(json_field "$CONFIG_STATUS_JSON" "ok")" == "True" || "$(json_field "$CONFIG_STATUS_JSON" "ok")" == "true" ]]
+REFRESH_CONFIG_JSON="$(run_json refresh-config --worker-user "$(basename "${HOME}")" --app-repo-path "${FAKE_REPO}" --config-path "${TEST_ROOT}/refreshed-repos.json" --json)"
+[[ "$(json_field "$REFRESH_CONFIG_JSON" "ok")" == "True" || "$(json_field "$REFRESH_CONFIG_JSON" "ok")" == "true" ]]
+[[ "$(json_field "$REFRESH_CONFIG_JSON" "data.status")" == "refreshed" ]]
+
 printf 'Phase 1: env-check\n'
 ENV_JSON="$(run_json env-check --repo masterofdrums-pipeline --json)"
 [[ "$(json_field "$ENV_JSON" "ok")" == "True" || "$(json_field "$ENV_JSON" "ok")" == "true" ]]
