@@ -478,14 +478,25 @@ def handler_self_update(args: argparse.Namespace, config: Dict[str, Any], repo_i
     ensure_clean_tree(info)
     previous_head = git_head(info)
     current_branch = run_subprocess(["git", "branch", "--show-current"], repo_info=info, timeout=10)["stdout"].strip()
-    ref = args.ref or "origin/main"
+    requested_ref = args.ref or "main"
 
     fetch_result = run_subprocess(["git", "fetch", "--prune", "origin"], repo_info=info, timeout=120)
-    verify_result = run_subprocess(["git", "rev-parse", "--verify", ref], repo_info=info, timeout=30)
-    if verify_result["status"] != 0:
-        raise AgentError("REF_NOT_FOUND", f"Update ref not found: {ref}", 22, {"ref": ref})
 
-    checkout_result = run_subprocess(["git", "checkout", "--force", ref], repo_info=info, timeout=120)
+    remote_branch_ref = requested_ref if requested_ref.startswith("origin/") else f"origin/{requested_ref}"
+    remote_verify = run_subprocess(["git", "rev-parse", "--verify", remote_branch_ref], repo_info=info, timeout=30)
+
+    if remote_verify["status"] == 0:
+        local_branch = requested_ref.removeprefix("origin/")
+        checkout_argv = ["git", "checkout", "--force", "-B", local_branch, remote_branch_ref]
+        resolved_ref = remote_branch_ref
+    else:
+        direct_verify = run_subprocess(["git", "rev-parse", "--verify", requested_ref], repo_info=info, timeout=30)
+        if direct_verify["status"] != 0:
+            raise AgentError("REF_NOT_FOUND", f"Update ref not found: {requested_ref}", 22, {"ref": requested_ref})
+        checkout_argv = ["git", "checkout", "--force", requested_ref]
+        resolved_ref = requested_ref
+
+    checkout_result = run_subprocess(checkout_argv, repo_info=info, timeout=120)
     new_head = git_head(info)
     status_lines = repo_status_lines(info)
     return {
@@ -493,13 +504,14 @@ def handler_self_update(args: argparse.Namespace, config: Dict[str, Any], repo_i
         "agent_repo": str(info["path"]),
         "previous_head": previous_head,
         "new_head": new_head,
-        "ref": ref,
+        "ref": requested_ref,
+        "resolved_ref": resolved_ref,
         "branch_before": current_branch,
         "branch_after": run_subprocess(["git", "branch", "--show-current"], repo_info=info, timeout=10)["stdout"].strip(),
         "is_dirty_before": False,
         "is_dirty_after": bool(status_lines),
         "fetch": {"exit_code": fetch_result["status"], "stdout": fetch_result["stdout"], "stderr": fetch_result["stderr"]},
-        "checkout": {"exit_code": checkout_result["status"], "stdout": checkout_result["stdout"], "stderr": checkout_result["stderr"]},
+        "checkout": {"exit_code": checkout_result["status"], "stdout": checkout_result["stdout"], "stderr": checkout_result["stderr"], "argv": checkout_argv},
     }
 
 
