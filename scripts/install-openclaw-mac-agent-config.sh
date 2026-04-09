@@ -44,11 +44,21 @@ cat > "${CONFIG_PATH}" <<EOF
     "masterofdrums-pipeline": {
       "path": "${APP_REPO_PATH}",
       "sample_sources": {
-        "known-tone": "file:///Users/${WORKER_USER}/workspace/masterofdrums-pipeline/Tests/PipelineRuntimeTests/Fixtures/known-tone.wav"
+        "known-tone": "file:///Users/${WORKER_USER}/workspace/masterofdrums-pipeline/Tests/PipelineRuntimeTests/Fixtures/known-tone.wav",
+        "looperman-sad-drum-part-trap": "file:///Users/${WORKER_USER}/workspace/openclaw-mac-agent/looperman-l-1561860-0105686-ricciog-sad-drum-part-trap.wav",
+        "looperman-dentist-drill-drums": "file:///Users/${WORKER_USER}/workspace/openclaw-mac-agent/looperman-l-2212484-0228674-dentist-drill-drums.wav",
+        "looperman-wheezy-type-drum-loop": "file:///Users/${WORKER_USER}/workspace/openclaw-mac-agent/looperman-l-2786851-0217164-wheezy-type-drum-loop.wav",
+        "looperman-motion-trap-drums": "file:///Users/${WORKER_USER}/workspace/openclaw-mac-agent/looperman-l-6643862-0403387-motion-trap-drums.wav"
       },
       "sample_sets": {
         "smoke": [
           "known-tone"
+        ],
+        "looperman-120": [
+          "looperman-sad-drum-part-trap",
+          "looperman-dentist-drill-drums",
+          "looperman-wheezy-type-drum-loop",
+          "looperman-motion-trap-drums"
         ]
       },
       "roots": {
