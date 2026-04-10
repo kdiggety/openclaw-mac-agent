@@ -44,6 +44,7 @@ PUBLIC_VERBS = {
     "validate-masterofdrums-chart",
     "run-pipeline",
     "get-run-status",
+    "safeguard-generated",
     "git-fetch",
     "git-pull",
     "git-sync",
@@ -113,6 +114,10 @@ def load_config(config_path: Optional[str]) -> Dict[str, Any]:
 
 def ensure_agent_home(agent_home: Path) -> None:
     (agent_home / "logs").mkdir(parents=True, exist_ok=True)
+
+
+def current_agent_home() -> Path:
+    return Path(os.environ.get("OPENCLAW_MAC_AGENT_HOME", DEFAULT_AGENT_HOME)).expanduser()
 
 
 def audit_log(agent_home: Path, record: Dict[str, Any]) -> None:
@@ -1493,6 +1498,49 @@ def handler_get_run_status(args: argparse.Namespace, config: Dict[str, Any], rep
     }
 
 
+def handler_safeguard_generated(args: argparse.Namespace, config: Dict[str, Any], repo_info: Dict[str, Any]) -> Dict[str, Any]:
+    if args.path != "charts":
+        raise AgentError("UNSUPPORTED_PATH", "Only charts is currently supported", 22, {"path": args.path})
+
+    repo_path = repo_info["path"]
+    target = ensure_within_root(repo_path, repo_path / args.path)
+    if not target.exists():
+        return {
+            "repo": repo_info["name"],
+            "path": args.path,
+            "exists": False,
+            "moved": False,
+        }
+
+    if not target.is_dir():
+        raise AgentError("UNSUPPORTED_PATH_TYPE", "Target must be a directory", 22, {"path": str(target)})
+
+    status_lines = repo_status_lines(repo_info)
+    expected_status = f"?? {args.path}/"
+    if expected_status not in status_lines:
+        raise AgentError(
+            "PATH_NOT_UNTRACKED_DIRECTORY",
+            "Target is not the expected untracked generated directory",
+            22,
+            {"path": args.path, "status_short": status_lines},
+        )
+
+    agent_home = current_agent_home()
+    backup_root = agent_home / "backups" / repo_info["name"]
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup_name = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{args.path}"
+    destination = backup_root / backup_name
+    shutil.move(str(target), str(destination))
+
+    return {
+        "repo": repo_info["name"],
+        "path": args.path,
+        "exists": True,
+        "moved": True,
+        "backup_path": str(destination),
+    }
+
+
 def ensure_clean_tree(repo_info: Dict[str, Any]) -> None:
     if repo_status_lines(repo_info):
         raise AgentError("CLEAN_TREE_REQUIRED", "Repository must be clean for this operation", 22, {"repo": repo_info["name"]})
@@ -1549,6 +1597,7 @@ HANDLERS = {
     "validate-masterofdrums-chart": handler_validate_masterofdrums_chart,
     "run-pipeline": handler_run_pipeline,
     "get-run-status": handler_get_run_status,
+    "safeguard-generated": handler_safeguard_generated,
     "git-fetch": handler_git_fetch,
     "git-pull": handler_git_pull,
     "git-sync": handler_git_sync,
@@ -1662,6 +1711,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser_run_status.add_argument("--repo", required=True)
     parser_run_status.add_argument("--run-id", required=True)
     parser_run_status.add_argument("--json", action="store_true")
+
+    parser_safeguard = subparsers.add_parser("safeguard-generated")
+    parser_safeguard.add_argument("--repo", required=True)
+    parser_safeguard.add_argument("--path", required=True)
+    parser_safeguard.add_argument("--json", action="store_true")
 
     parser_fetch = subparsers.add_parser("git-fetch")
     parser_fetch.add_argument("--repo", required=True)
